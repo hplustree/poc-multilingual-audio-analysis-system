@@ -32,6 +32,22 @@ def transcribe(audio_url):
         st.info("Transcription in progress...")
         import time; time.sleep(3)
 
+def normalize_speakers(utterances):
+    """Rename speakers to Speaker A, B, ... and remove timestamps"""
+    speaker_map = {}
+    next_label = ord("A")
+    normalized = []
+    for utt in utterances:
+        orig_speaker = utt["speaker"]
+        if orig_speaker not in speaker_map:
+            speaker_map[orig_speaker] = f"Speaker {chr(next_label)}"
+            next_label += 1
+        normalized.append({
+            "speaker": speaker_map[orig_speaker],
+            "text": utt["text"]
+        })
+    return normalized
+
 # Streamlit UI
 st.title("Audio Transcription + Multi-Speaker Diarization")
 uploaded_file = st.file_uploader("Upload a WAV/MP3", type=["wav","mp3","m4a"])
@@ -49,5 +65,7 @@ if uploaded_file:
     st.text_area("Text", result.get("text", ""), height=300)
 
     st.subheader("Speakers")
-    for utt in result.get("utterances", []):
-        st.write(f"{utt['speaker']} [{utt['start']} - {utt['end']}]: {utt['text']}")
+    speakers = normalize_speakers(result.get("utterances", []))
+    for utt in speakers:
+        st.write(f"{utt['speaker']}: {utt['text']}")
+
