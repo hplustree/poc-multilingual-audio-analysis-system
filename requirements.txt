@@ -5,3 +5,4 @@ pyyaml==6.0.3
 
 # Audio/ML packages (AssemblyAI only)
 assemblyai==0.44.3
+anthropic==0.39.0
