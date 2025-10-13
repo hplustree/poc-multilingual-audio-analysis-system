@@ -7,7 +7,8 @@ import time
 import json
 import re
 import unicodedata
-
+import httpx
+import os
 
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
@@ -20,9 +21,15 @@ client = Anthropic(api_key=CLAUDE_API_KEY)
 def upload_file(file_path):
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     with open(file_path, "rb") as f:
-        r = requests.post(UPLOAD_URL, headers=headers, data=f)
-    r.raise_for_status()
-    return r.json()["upload_url"]
+        # Upload in streaming chunks (recommended by AssemblyAI)
+        with httpx.Client(http2=False, timeout=None) as client:
+            response = client.post(
+                UPLOAD_URL,
+                headers=headers,
+                content=f  # ✅ raw bytes, not multipart
+            )
+            response.raise_for_status()
+            return response.json()["upload_url"]
 
 def transcribe(audio_url):
     headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
@@ -94,17 +101,33 @@ def robust_sanitize_multilingual_text(raw_text: str) -> str:
 
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
+    prompt = f"""Analyze the sentiment and content of the following text and respond ONLY with valid JSON.
 
-    prompt = f"""
-Analyze the following transcription text:
+    Text to analyze:
+    {sanitized_text}
 
-{sanitized_text}
+    Requirements:
+    1. Determine the overall sentiment (Positive, Negative, or Neutral)
+    2. Assign a sentiment score from 0.0 (most negative) to 1.0 (most positive), where 0.5 is neutral
+    3. Categorize the main topic/theme
+    4. Explain why you assigned this sentiment
+    5. Provide a brief summary
 
-Provide in valid JSON format with **all keys present**:
-Category, Sentiment Score (0.0 to 1.0), Sentiment Label ("Positive", "Neutral", or "Negative"), Reason, Summary.
+    Respond with this exact JSON structure (no additional text):
+    {{
+    "Category": "the main topic or theme",
+    "Sentiment Score": 0.0,
+    "Sentiment Label": "Positive/Negative/Neutral",
+    "Reason": "explanation of sentiment determination",
+    "Summary": "brief summary of the text"
+    }}
 
-Even if the text is neutral, include Sentiment Score and Label.
-"""
+    Examples:
+    - "I love this product!" → Score: 0.9, Label: "Positive"
+    - "This is terrible and broken" → Score: 0.1, Label: "Negative"  
+    - "The meeting is scheduled for 3pm" → Score: 0.5, Label: "Neutral"
+
+    Return ONLY the JSON object, no markdown formatting or extra text."""
 
     try:
         response = client.messages.create(
@@ -113,43 +136,57 @@ Even if the text is neutral, include Sentiment Score and Label.
             temperature=0,
             messages=[{"role": "user", "content": prompt}]
         )
-
-        response_text = response.content[0].text.strip()
-
+        response_text = response.content[0].text.strip()  
         # Remove Markdown formatting if present
         response_text = re.sub(r"^```(json)?", "", response_text)
         response_text = re.sub(r"```$", "", response_text).strip()
-
-        # --- Robust JSON extraction ---
-        # Find the first {...} block (ignores any extra text Claude may include)
+        
+        # Extract JSON object
         match = re.search(r"\{[\s\S]*\}", response_text)
         if match:
             json_str = match.group(0)
         else:
             json_str = response_text
-
-        # Try parsing directly
+        
+        # Parse JSON
+        result = json.loads(json_str)
+        
+        # Validate required keys
+        required_keys = ["Category", "Sentiment Score", "Sentiment Label", "Reason", "Summary"]
+        for key in required_keys:
+            if key not in result:
+                result[key] = "Unknown" if key != "Sentiment Score" else 0.5
+        
+        # Ensure sentiment score is a float between 0 and 1
         try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            # If JSON still invalid, attempt auto-fix (escape unescaped quotes, remove newlines)
-            safe_json = (
-                json_str
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            return json.loads(safe_json)
-
-    except Exception as e:
-        st.error(f"Claude API error or parse failure: {e}")
-        # Return a fallback result so Streamlit doesn’t break
+            result["Sentiment Score"] = float(result["Sentiment Score"])
+            result["Sentiment Score"] = max(0.0, min(1.0, result["Sentiment Score"]))
+        except (ValueError, TypeError):
+            result["Sentiment Score"] = 0.5
+            
+        # Ensure sentiment label is valid
+        if result["Sentiment Label"] not in ["Positive", "Negative", "Neutral"]:
+            result["Sentiment Label"] = "Neutral"
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        st.error(f"JSON parsing error: {e}")
         return {
             "Category": "Parse Error",
             "Sentiment Score": 0.5,
-            "Sentiment Label": "Unknown",
-            "Reason": f"Failed to parse Claude response ({str(e)})",
+            "Sentiment Label": "Neutral",
+            "Reason": f"Failed to parse Claude response: {str(e)}",
             "Summary": response_text[:500] if 'response_text' in locals() else "Error",
+        }
+    except Exception as e:
+        st.error(f"Claude API error: {e}")
+        return {
+            "Category": "API Error",
+            "Sentiment Score": 0.5,
+            "Sentiment Label": "Neutral",
+            "Reason": f"API call failed: {str(e)}",
+            "Summary": "Unable to analyze text",
         }
 
 
