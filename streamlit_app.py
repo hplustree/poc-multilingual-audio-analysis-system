@@ -7,7 +7,6 @@ import re
 import unicodedata
 import time
 import httpx
-import torch
 from pyannote.audio import Pipeline
 import whisper
 from anthropic import Anthropic
@@ -138,8 +137,6 @@ def load_diarization_model():
         "pyannote/speaker-diarization-3.1",
         use_auth_token=HUGGINGFACE_TOKEN
     )
-    if torch.cuda.is_available():
-        pipeline.to(torch.device("cuda"))
     return pipeline
 
 def diarize_with_pyannote(audio_path):
