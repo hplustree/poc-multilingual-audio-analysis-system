@@ -404,38 +404,86 @@ def robust_sanitize_multilingual_text(raw_text: str) -> str:
 
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
-    prompt = f"""You are an expert linguist analyzing a transcribed multi-speaker conversation.
+    prompt = f"""You are an expert linguist and voice analyst analyzing a multi-speaker conversation.
 
     Text to analyze:
     {sanitized_text}
 
     Your task:
-    1. Determine the **overall sentiment** of the full conversation: Positive, Negative, or Neutral.
-    2. Assign a **sentiment score** between 0.0 (very negative) and 1.0 (very positive), with 0.5 being neutral.
-    3. Identify the **main topic or theme** of the discussion.
-    4. Summarize **how the conversation flows** between speakers:
-       - Who spoke more
-       - Whether it was cooperative, argumentative, or one-sided
-       - The emotional tone progression (e.g., starts calm → becomes frustrated)
-    5. Briefly explain **why** you assigned that sentiment.
-    6. Write a **short summary** of the overall conversation.
+    1. Determine the overall sentiment of the full conversation: Positive, Negative, or Neutral.
+    2. Assign a sentiment score between 0.0 (very negative) and 1.0 (very positive), with 0.5 being neutral.
+    3. Identify the main topic or theme of the discussion.
+    4. Summarize how the conversation flows between speakers:
+    - Who spoke more
+    - Whether it was cooperative, argumentative, or one-sided
+    - Emotional tone progression (e.g., calm → frustrated → calm)
+    5. Analyze emotional progression in detail:
+    - For each speaker, describe how their emotions change over time (e.g., Confused → Understanding → Receptive)
+    - For each change, briefly explain:
+        * HOW the tone or wording indicated the shift (e.g., calmer tone, polite phrasing, affirming words)
+        * WHY the change likely happened (e.g., received clarification, gained trust, felt understood)
+        * WHERE it occurred — reference an approximate quote or conversational point
+    6. Analyze each speaker based on voice cues (tone, pitch, energy):
+    - Likely mood/emotion throughout the conversation
+    - Possible gender and approximate age group if inferable
+    7. Briefly explain why you assigned that sentiment.
+    8. Write a short summary of the overall conversation.
 
-    Respond ONLY with valid JSON, using this exact structure:
+    Respond ONLY with valid JSON using this exact structure:
     {{
         "Category": "main topic or theme",
         "Sentiment Score": 0.0,
         "Sentiment Label": "Positive/Negative/Neutral",
         "Conversation Flow": "description of how the conversation developed between speakers",
+        "Emotion Flow": [
+            {{
+                "Speaker": "Rep",
+                "Emotions": ["Professional", "Informative", "Helpful"],
+                "Transitions": [
+                    {{
+                        "From": "Professional",
+                        "To": "Informative",
+                        "How": "Tone became explanatory and confident",
+                        "Why": "Customer asked for clarification",
+                        "Where": "When discussing the billing process"
+                    }},
+                    {{
+                        "From": "Informative",
+                        "To": "Helpful",
+                        "How": "Used reassuring phrases like 'I can help you with that'",
+                        "Why": "Customer started to understand and engage positively",
+                        "Where": "After explaining next steps"
+                    }}
+                ]
+            }},
+            {{
+                "Speaker": "Customer",
+                "Emotions": ["Confused", "Understanding", "Receptive"],
+                "Transitions": [
+                    {{
+                        "From": "Confused",
+                        "To": "Understanding",
+                        "How": "Questions became clearer and more specific",
+                        "Why": "Rep explained terms clearly",
+                        "Where": "Midway through the call"
+                    }},
+                    {{
+                        "From": "Understanding",
+                        "To": "Receptive",
+                        "How": "Tone became calmer and affirming",
+                        "Why": "Customer felt supported and satisfied",
+                        "Where": "At the end of the conversation"
+                    }}
+                ]
+            }}
+        ],
+        "Speaker Analysis": [
+            {{"Speaker": "Speaker 1", "Mood": "calm", "Gender": "Female", "Age": "30-40"}},
+            {{"Speaker": "Speaker 2", "Mood": "frustrated", "Gender": "Male", "Age": "40-50"}}
+        ],
         "Reason": "explanation of sentiment determination",
         "Summary": "brief summary of the conversation"
     }}
-
-    Examples:
-    - Customer complaint call → Sentiment Label: Negative, Flow: 'Customer is frustrated, agent stays calm.'
-    - Friendly discussion → Sentiment Label: Positive, Flow: 'Both speakers are polite and cooperative.'
-    - Meeting notes → Sentiment Label: Neutral, Flow: 'Speakers exchange factual information with no emotional tone.'
-
-    Return ONLY the JSON object — no markdown, no extra commentary.
     """
 
     try:
@@ -558,6 +606,25 @@ if uploaded_file:
         st.write("**Sentiment Label:**", analysis.get("Sentiment Label", "N/A"))
         st.write("**Conversation Flow:**", analysis.get("Conversation Flow", "N/A"))
         st.write("**Reason:**", analysis.get("Reason", "N/A"))
+        emotion_flow = analysis.get("Emotion Flow", [])
+        if isinstance(emotion_flow, list) and emotion_flow:
+            st.subheader("🧠 Emotion Flow Analysis")
+            for speaker_data in emotion_flow:
+                st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
+                for t in speaker_data.get("Transitions", []):
+                    st.write(f"• **{t['From']} → {t['To']}**")
+                    st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
+        else:
+            st.info("No detailed emotion flow available.")
+
+        st.subheader("Speaker Analysis")
+        speaker_analysis = analysis.get("Speaker Analysis", [])
+        if speaker_analysis:
+            for sa in speaker_analysis:
+                st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}, Age: {sa.get('Age','N/A')}")
+        else:
+            st.info("No speaker analysis available")
+
         st.subheader("Summary")
         st.text_area("Summary", analysis.get("Summary", ""), height=200)
                 
