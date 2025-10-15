@@ -621,7 +621,7 @@ if uploaded_file:
         speaker_analysis = analysis.get("Speaker Analysis", [])
         if speaker_analysis:
             for sa in speaker_analysis:
-                st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}, Age: {sa.get('Age','N/A')}")
+                st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
         else:
             st.info("No speaker analysis available")
 
