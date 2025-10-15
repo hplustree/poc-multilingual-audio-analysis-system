@@ -257,13 +257,16 @@ import streamlit as st
 import requests
 import tempfile
 import os
-from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+from anthropic import Anthropic
 import time
 import json
 import re
 import unicodedata
 import httpx
-import os
+import noisereduce as nr
+import soundfile as sf
+import numpy as np
+
 
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
@@ -276,25 +279,70 @@ client = Anthropic(api_key=CLAUDE_API_KEY)
 def upload_file(file_path):
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     with open(file_path, "rb") as f:
-        # Upload in streaming chunks (recommended by AssemblyAI)
-        with httpx.Client(http2=False, timeout=None) as client:
-            response = client.post(
+        with httpx.Client(http2=False, timeout=None) as http_client:
+            response = http_client.post(
                 UPLOAD_URL,
                 headers=headers,
-                content=f  # ✅ raw bytes, not multipart
+                content=f
             )
             response.raise_for_status()
             return response.json()["upload_url"]
 
-def transcribe(audio_url):
+def denoise_audio(input_path):
+    """Remove background noise using spectral gating (noisereduce)."""
+    st.info("Denoising audio...")
+    try:
+        data, samplerate = sf.read(input_path)
+        if len(data.shape) > 1:  # stereo → mono
+            data = np.mean(data, axis=1)
+        reduced_noise = nr.reduce_noise(y=data, sr=samplerate)
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        sf.write(out_path, reduced_noise, samplerate)
+        st.success("Noise reduced successfully!")
+        return out_path
+    except Exception as e:
+        st.warning(f"enoising failed: {e}, using original audio.")
+        return input_path
+
+def detect_language(audio_url):
+    """First pass: detect the dominant language"""
     headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
-    data = {"audio_url": audio_url, "speaker_labels": True, "language_detection": True}
+    data = {
+        "audio_url": audio_url,
+        "language_detection": True
+    }
+    r = requests.post(TRANSCRIPT_URL, headers=headers, json=data)
+    r.raise_for_status()
+    transcript_id = r.json()["id"]
+    polling_url = f"{TRANSCRIPT_URL}/{transcript_id}"
+    with st.spinner("🔍 Detecting language..."):
+        while True:
+            r = requests.get(polling_url, headers=headers)
+            res = r.json()
+            if res["status"] == "completed":
+                detected_lang = res.get("language_code", "en")
+                confidence = res.get("language_confidence", 0)
+                st.success(f"✅ Detected: **{detected_lang.upper()}** (confidence: {confidence:.2f})")
+                return detected_lang
+            elif res["status"] == "error":
+                st.warning("⚠️ Language detection failed, defaulting to English")
+                return "en"
+            time.sleep(2)
+
+def transcribe(audio_url, language_code):
+    """Second pass: transcribe with detected language"""
+    headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+    data = {
+        "audio_url": audio_url, 
+        "speaker_labels": True, 
+        "language_code": language_code
+    }
     r = requests.post(TRANSCRIPT_URL, headers=headers, json=data)
     r.raise_for_status()
     transcript_id = r.json()["id"]
 
     polling_url = f"{TRANSCRIPT_URL}/{transcript_id}"
-    with st.spinner():
+    with st.spinner(f"📝 Transcribing in **{language_code.upper()}**..."):
         while True:
             r = requests.get(polling_url, headers=headers)
             res = r.json()
@@ -356,33 +404,39 @@ def robust_sanitize_multilingual_text(raw_text: str) -> str:
 
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
-    prompt = f"""Analyze the sentiment and content of the following text and respond ONLY with valid JSON.
+    prompt = f"""You are an expert linguist analyzing a transcribed multi-speaker conversation.
 
     Text to analyze:
     {sanitized_text}
 
-    Requirements:
-    1. Determine the overall sentiment (Positive, Negative, or Neutral)
-    2. Assign a sentiment score from 0.0 (most negative) to 1.0 (most positive), where 0.5 is neutral
-    3. Categorize the main topic/theme
-    4. Explain why you assigned this sentiment
-    5. Provide a brief summary
+    Your task:
+    1. Determine the **overall sentiment** of the full conversation: Positive, Negative, or Neutral.
+    2. Assign a **sentiment score** between 0.0 (very negative) and 1.0 (very positive), with 0.5 being neutral.
+    3. Identify the **main topic or theme** of the discussion.
+    4. Summarize **how the conversation flows** between speakers:
+       - Who spoke more
+       - Whether it was cooperative, argumentative, or one-sided
+       - The emotional tone progression (e.g., starts calm → becomes frustrated)
+    5. Briefly explain **why** you assigned that sentiment.
+    6. Write a **short summary** of the overall conversation.
 
-    Respond with this exact JSON structure (no additional text):
+    Respond ONLY with valid JSON, using this exact structure:
     {{
-    "Category": "the main topic or theme",
-    "Sentiment Score": 0.0,
-    "Sentiment Label": "Positive/Negative/Neutral",
-    "Reason": "explanation of sentiment determination",
-    "Summary": "brief summary of the text"
+        "Category": "main topic or theme",
+        "Sentiment Score": 0.0,
+        "Sentiment Label": "Positive/Negative/Neutral",
+        "Conversation Flow": "description of how the conversation developed between speakers",
+        "Reason": "explanation of sentiment determination",
+        "Summary": "brief summary of the conversation"
     }}
 
     Examples:
-    - "I love this product!" → Score: 0.9, Label: "Positive"
-    - "This is terrible and broken" → Score: 0.1, Label: "Negative"  
-    - "The meeting is scheduled for 3pm" → Score: 0.5, Label: "Neutral"
+    - Customer complaint call → Sentiment Label: Negative, Flow: 'Customer is frustrated, agent stays calm.'
+    - Friendly discussion → Sentiment Label: Positive, Flow: 'Both speakers are polite and cooperative.'
+    - Meeting notes → Sentiment Label: Neutral, Flow: 'Speakers exchange factual information with no emotional tone.'
 
-    Return ONLY the JSON object, no markdown formatting or extra text."""
+    Return ONLY the JSON object — no markdown, no extra commentary.
+    """
 
     try:
         response = client.messages.create(
@@ -391,35 +445,36 @@ def analyze_with_claude(text):
             temperature=0,
             messages=[{"role": "user", "content": prompt}]
         )
-        response_text = response.content[0].text.strip()  
-        # Remove Markdown formatting if present
+        response_text = response.content[0].text.strip()
         response_text = re.sub(r"^```(json)?", "", response_text)
         response_text = re.sub(r"```$", "", response_text).strip()
-        
-        # Extract JSON object
+
         match = re.search(r"\{[\s\S]*\}", response_text)
         if match:
             json_str = match.group(0)
         else:
             json_str = response_text
-        
-        # Parse JSON
+
         result = json.loads(json_str)
-        
-        # Validate required keys
-        required_keys = ["Category", "Sentiment Score", "Sentiment Label", "Reason", "Summary"]
+
+        required_keys = [
+            "Category",
+            "Sentiment Score",
+            "Sentiment Label",
+            "Conversation Flow",
+            "Reason",
+            "Summary"
+        ]
         for key in required_keys:
             if key not in result:
                 result[key] = "Unknown" if key != "Sentiment Score" else 0.5
-        
-        # Ensure sentiment score is a float between 0 and 1
+
         try:
             result["Sentiment Score"] = float(result["Sentiment Score"])
             result["Sentiment Score"] = max(0.0, min(1.0, result["Sentiment Score"]))
         except (ValueError, TypeError):
             result["Sentiment Score"] = 0.5
-            
-        # Ensure sentiment label is valid
+
         if result["Sentiment Label"] not in ["Positive", "Negative", "Neutral"]:
             result["Sentiment Label"] = "Neutral"
         
@@ -431,6 +486,7 @@ def analyze_with_claude(text):
             "Category": "Parse Error",
             "Sentiment Score": 0.5,
             "Sentiment Label": "Neutral",
+            "Conversation Flow": "N/A",
             "Reason": f"Failed to parse Claude response: {str(e)}",
             "Summary": response_text[:500] if 'response_text' in locals() else "Error",
         }
@@ -440,43 +496,74 @@ def analyze_with_claude(text):
             "Category": "API Error",
             "Sentiment Score": 0.5,
             "Sentiment Label": "Neutral",
+            "Conversation Flow": "N/A",
             "Reason": f"API call failed: {str(e)}",
             "Summary": "Unable to analyze text",
         }
 
-
 # === Streamlit UI ===
-st.title("Audio Transcription + Multi-Speaker Diarization")
+st.title("🎙️ Audio Transcription + Multi-Speaker Diarization")
+st.caption("Automatic language detection → Accurate transcription with speaker identification")
+
 uploaded_file = st.file_uploader("Upload a WAV/MP3/M4A file", type=["wav", "mp3", "m4a"])
 
 if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
         tmp.write(uploaded_file.read())
         tmp.flush()
         path = tmp.name
     
-    audio_url = upload_file(path)
-    result = transcribe(audio_url)
-    
-    st.subheader("Full Transcription")
-    st.text_area("Text", result.get("text", ""), height=300)
+    try:
+        # Step 1: Upload file
+        denoised_path = denoise_audio(path)
+        with st.spinner("⬆️ Uploading audio..."):
+            audio_url = upload_file(path)
+            st.success("✅ Upload complete!")
+        
+        # Step 2: Detect language
+        detected_language = detect_language(audio_url)
+        
+        # Step 3: Transcribe with detected language
+        result = transcribe(audio_url, language_code=detected_language)
+        
+        if result:
+            # Display full transcription
+            st.subheader("📄 Full Transcription")
+            full_text = result.get("text", "")
+            st.text_area("Complete Text", full_text, height=300)
 
-    st.subheader("Speakers")
-    speakers = normalize_speakers(result.get("utterances", []))
-    for utt in speakers:
-        st.write(f"{utt['speaker']}: {utt['text']}")
+            # Display speaker conversation
+            st.subheader("👥 Speaker-wise Conversation")
+            speakers = normalize_speakers(result.get("utterances", []))
+            
+            if speakers:
+                for utt in speakers:
+                    col1, col2 = st.columns([1, 5])
+                    with col1:
+                        st.markdown(f"**{utt['speaker']}**")
+                    with col2:
+                        st.write(utt['text'])
+                    st.divider()
+            else:
+                st.info("No speaker diarization data available")
 
-    # Claude analysis
-    full_text = result.get("text", "")
-    if full_text:
-        st.subheader("Analysis: Summary & Sentiment")
-        with st.spinner("Analyzing with Claude..."):
-            analysis = analyze_with_claude(full_text)
+            # Claude analysis
+            if full_text:
+                st.subheader("🤖 AI Analysis: Summary & Sentiment")
+                with st.spinner("Analyzing with Claude..."):
+                    analysis = analyze_with_claude(full_text)
 
         st.write("**Category:**", analysis.get("Category", "N/A"))
         st.write("**Sentiment Score:**", analysis.get("Sentiment Score", "N/A"))
         st.write("**Sentiment Label:**", analysis.get("Sentiment Label", "N/A"))
+        st.write("**Conversation Flow:**", analysis.get("Conversation Flow", "N/A"))
         st.write("**Reason:**", analysis.get("Reason", "N/A"))
         st.subheader("Summary")
         st.text_area("Summary", analysis.get("Summary", ""), height=200)
+                
+    except Exception as e:
+        st.error(f"❌ Error processing audio: {e}")
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
