@@ -253,6 +253,7 @@
 #     finally:
 #         if os.path.exists(path):
 #             os.unlink(path)
+from io import BytesIO
 import streamlit as st
 import requests
 import tempfile
@@ -266,12 +267,15 @@ import httpx
 import noisereduce as nr
 import soundfile as sf
 import numpy as np
+from elevenlabs.client import ElevenLabs
 
 
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
 UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
+ELEVEN_API_KEY = st.secrets["api_keys"]["elevenlabs"]
+elevenlabs = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 CLAUDE_API_KEY = st.secrets["api_keys"]["anthropic"]
 client = Anthropic(api_key=CLAUDE_API_KEY)
@@ -328,6 +332,81 @@ def detect_language(audio_url):
                 st.warning("⚠️ Language detection failed, defaulting to English")
                 return "en"
             time.sleep(2)
+
+def format_speaker_diarization(transcription):
+    """
+    Format ElevenLabs transcription with speaker diarization.
+    Groups consecutive words by the same speaker into dialogue turns.
+    Fixes spacing and punctuation issues.
+    """
+    if not hasattr(transcription, 'words') or not transcription.words:
+        return []
+
+    formatted_lines = []
+    current_speaker = None
+    current_text = []
+
+    for word_obj in transcription.words:
+        # Skip spacing tokens if any
+        if getattr(word_obj, "type", None) == "spacing":
+            continue
+
+        speaker = getattr(word_obj, "speaker_id", None)
+        word = getattr(word_obj, "text", "")
+
+        # Speaker changed — push previous segment
+        if speaker != current_speaker:
+            if current_speaker is not None and current_text:
+                # Join words with spaces and fix spacing issues
+                text = " ".join(current_text).strip()
+                text = re.sub(r"\s+([,.!?।])", r"\1", text)  # no space before punctuation
+                text = re.sub(r"([,.!?।])([^\s])", r"\1 \2", text)  # add space after punctuation
+                speaker_label = current_speaker.replace("speaker_", "Speaker ")
+                formatted_lines.append({
+                    "speaker": speaker_label,
+                    "text": text
+                })
+            current_speaker = speaker
+            current_text = [word]
+        else:
+            current_text.append(word)
+
+    # Add the last dialogue turn
+    if current_speaker is not None and current_text:
+        text = " ".join(current_text).strip()
+        text = re.sub(r"\s+([,.!?।])", r"\1", text)
+        text = re.sub(r"([,.!?।])([^\s])", r"\1 \2", text)
+        speaker_label = current_speaker.replace("speaker_", "Speaker ")
+        formatted_lines.append({
+            "speaker": speaker_label,
+            "text": text
+        })
+
+    return formatted_lines
+
+
+def transcribe_elevenlabs(file_path, language_code):
+    """Transcribe via ElevenLabs and format speaker diarization if available."""
+    with open(file_path, "rb") as f:
+        audio_data = BytesIO(f.read())
+
+    transcription = elevenlabs.speech_to_text.convert(
+        file=audio_data,
+        model_id="scribe_v1",
+        language_code=language_code,
+        diarize=True
+    )
+
+    # Format diarization output if available
+    utterances = format_speaker_diarization(transcription)
+    
+    # Return unified result structure
+    result = {
+        "text": getattr(transcription, "text", ""),
+        "utterances": utterances
+    }
+    return result
+
 
 def transcribe(audio_url, language_code):
     """Second pass: transcribe with detected language"""
@@ -551,6 +630,7 @@ def analyze_with_claude(text):
 
 # === Streamlit UI ===
 st.title("🎙️ Audio Transcription + Multi-Speaker Diarization")
+provider = st.selectbox("Select STT Provider", ["AssemblyAI", "ElevenLabs"])
 st.caption("Automatic language detection → Accurate transcription with speaker identification")
 
 uploaded_file = st.file_uploader("Upload a WAV/MP3/M4A file", type=["wav", "mp3", "m4a"])
@@ -570,9 +650,12 @@ if uploaded_file:
         
         # Step 2: Detect language
         detected_language = detect_language(audio_url)
+        if provider == "AssemblyAI":
         
         # Step 3: Transcribe with detected language
-        result = transcribe(audio_url, language_code=detected_language)
+            result = transcribe(audio_url, language_code=detected_language)
+        else:
+            result = transcribe_elevenlabs(denoised_path, detected_language)
         
         if result:
             # Display full transcription
