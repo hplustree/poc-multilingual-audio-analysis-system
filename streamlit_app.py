@@ -474,96 +474,102 @@ def robust_sanitize_multilingual_text(raw_text: str) -> str:
     
     # Escape special characters that might break JSON
     text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-    
-    # Collapse multiple spaces
-    text = re.sub(r"\s+", " ", text).strip()
-    
-    return text
 
+    # Collapse redundant whitespace
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_json_from_text(response_text: str) -> dict:
+    """
+    Robust JSON extraction and repair for AI responses.
+    """
+    response_text = response_text.strip()
+    response_text = re.sub(r"^```(json)?", "", response_text)
+    response_text = re.sub(r"```$", "", response_text).strip()
+
+    # Try to extract the JSON block
+    match = re.search(r"\{[\s\S]*\}", response_text)
+    json_str = match.group(0) if match else response_text
+
+    # Clean up known issues
+    json_str = (
+        json_str.replace("\\'", "'")
+        .replace('\\"', '"')
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\t", " ")
+    )
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        # Attempt minor repairs: missing commas or quotes
+        repaired = re.sub(r"(\w)\"(\w)", r'\1", "\2', json_str)
+        repaired = repaired.replace("\\", "")
+        try:
+            import json5
+            return json5.loads(repaired)
+        except Exception:
+            return {"Category": "Parse Error", "Sentiment Label": "Neutral", "Reason": "Invalid JSON returned by Claude", "Raw": json_str[:4000]}
 
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
-    prompt = f"""You are an expert linguist and voice analyst analyzing a multi-speaker conversation.
+    prompt = f"""Analyze this conversation and return your analysis as a JSON object.
 
-    Text to analyze:
-    {sanitized_text}
+<conversation>
+{sanitized_text}
+</conversation>
 
-    Your task:
-    1. Determine the overall sentiment of the full conversation: Positive, Negative, or Neutral.
-    2. Assign a sentiment score between 0.0 (very negative) and 1.0 (very positive), with 0.5 being neutral.
-    3. Identify the main topic or theme of the discussion.
-    4. Summarize how the conversation flows between speakers:
-    - Who spoke more
-    - Whether it was cooperative, argumentative, or one-sided
-    - Emotional tone progression (e.g., calm → frustrated → calm)
-    5. Analyze emotional progression in detail:
-    - For each speaker, describe how their emotions change over time (e.g., Confused → Understanding → Receptive)
-    - For each change, briefly explain:
-        * HOW the tone or wording indicated the shift (e.g., calmer tone, polite phrasing, affirming words)
-        * WHY the change likely happened (e.g., received clarification, gained trust, felt understood)
-        * WHERE it occurred — reference an approximate quote or conversational point
-    6. Analyze each speaker based on voice cues (tone, pitch, energy):
-    - Likely mood/emotion throughout the conversation
-    - Possible gender and approximate age group if inferable
-    7. Briefly explain why you assigned that sentiment.
-    8. Write a short summary of the overall conversation.
+Analyze the conversation for:
+1. Overall sentiment (Positive/Negative/Neutral) and score (0.0 to 1.0)
+2. Main topic/category
+3. How the conversation flows between speakers
+4. Emotional progression for each speaker with transitions
+5. Speaker characteristics (mood, likely gender, approximate age)
+6. Brief summary
 
-    Respond ONLY with valid JSON using this exact structure:
+IMPORTANT FORMATTING RULES:
+- Output ONLY a valid JSON object
+- Do NOT use markdown code blocks or backticks
+- Do NOT add any text before or after the JSON
+- Ensure all strings are properly escaped
+- Use double quotes for all keys and string values
+- Keep all text values on single lines (no line breaks within strings)
+- Ensure all brackets and braces are properly closed
+
+Return this exact JSON structure:
+{{
+  "Category": "main topic here",
+  "Sentiment Score": 0.75,
+  "Sentiment Label": "Positive",
+  "Conversation Flow": "single line description of how conversation developed",
+  "Emotion Flow": [
     {{
-        "Category": "main topic or theme",
-        "Sentiment Score": 0.0,
-        "Sentiment Label": "Positive/Negative/Neutral",
-        "Conversation Flow": "description of how the conversation developed between speakers",
-        "Emotion Flow": [
-            {{
-                "Speaker": "Rep",
-                "Emotions": ["Professional", "Informative", "Helpful"],
-                "Transitions": [
-                    {{
-                        "From": "Professional",
-                        "To": "Informative",
-                        "How": "Tone became explanatory and confident",
-                        "Why": "Customer asked for clarification",
-                        "Where": "When discussing the billing process"
-                    }},
-                    {{
-                        "From": "Informative",
-                        "To": "Helpful",
-                        "How": "Used reassuring phrases like 'I can help you with that'",
-                        "Why": "Customer started to understand and engage positively",
-                        "Where": "After explaining next steps"
-                    }}
-                ]
-            }},
-            {{
-                "Speaker": "Customer",
-                "Emotions": ["Confused", "Understanding", "Receptive"],
-                "Transitions": [
-                    {{
-                        "From": "Confused",
-                        "To": "Understanding",
-                        "How": "Questions became clearer and more specific",
-                        "Why": "Rep explained terms clearly",
-                        "Where": "Midway through the call"
-                    }},
-                    {{
-                        "From": "Understanding",
-                        "To": "Receptive",
-                        "How": "Tone became calmer and affirming",
-                        "Why": "Customer felt supported and satisfied",
-                        "Where": "At the end of the conversation"
-                    }}
-                ]
-            }}
-        ],
-        "Speaker Analysis": [
-            {{"Speaker": "Speaker 1", "Mood": "calm", "Gender": "Female", "Age": "30-40"}},
-            {{"Speaker": "Speaker 2", "Mood": "frustrated", "Gender": "Male", "Age": "40-50"}}
-        ],
-        "Reason": "explanation of sentiment determination",
-        "Summary": "brief summary of the conversation"
+      "Speaker": "Speaker A",
+      "Emotions": ["Emotion1", "Emotion2"],
+      "Transitions": [
+        {{
+          "From": "Emotion1",
+          "To": "Emotion2",
+          "How": "description of how tone changed",
+          "Why": "reason for change",
+          "Where": "context or quote"
+        }}
+      ]
     }}
-    """
+  ],
+  "Speaker Analysis": [
+    {{"Speaker": "Speaker A", "Mood": "happy", "Gender": "Male", "Age": "30-40"}}
+  ],
+  "Reason": "explanation for sentiment determination",
+  "Summary": "brief summary of conversation"
+}}
+
+Make sure your output is strictly valid JSON and passes json.loads() in Python without any errors.
+Output the JSON now:"""
 
     try:
         response = client.messages.create(
