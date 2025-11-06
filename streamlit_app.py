@@ -688,7 +688,7 @@ if uploaded_file:
         detected_language = detect_language(audio_url)
         if provider == "Soniox":
             with st.spinner("Transcribing with Soniox..."):
-                result = soniox_get_transcript('e20cc6ee-4e09-4783-b369-a0b14e6ebeba')
+                result = transcribe_soniox(denoised_path, detected_language)
         elif provider == "AssemblyAI":
         # Step 3: Transcribe with detected language
             result = transcribe(audio_url, language_code=detected_language)
