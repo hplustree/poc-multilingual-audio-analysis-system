@@ -6,7 +6,8 @@ pyyaml==6.0.3
 # API clients
 assemblyai==0.44.3
 anthropic==0.69.0
-httpx==0.27.2
+httpx[http2]==0.28.1
+h2==4.3.0
 
 # Audio and ML utilities
 soundfile==0.13.1
