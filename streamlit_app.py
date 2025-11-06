@@ -253,7 +253,6 @@
 #     finally:
 #         if os.path.exists(path):
 #             os.unlink(path)
-from io import BytesIO
 import streamlit as st
 import requests
 import tempfile
@@ -267,18 +266,15 @@ import httpx
 import noisereduce as nr
 import soundfile as sf
 import numpy as np
-from elevenlabs.client import ElevenLabs
-
 
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
 UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
-ELEVEN_API_KEY = st.secrets["api_keys"]["elevenlabs"]
-elevenlabs = ElevenLabs(api_key=ELEVEN_API_KEY)
-
 CLAUDE_API_KEY = st.secrets["api_keys"]["anthropic"]
 client = Anthropic(api_key=CLAUDE_API_KEY)
+SONIOX_BASE_URL = "https://api.soniox.com/v1"
+SONIOX_API_KEY= st.secrets["api_keys"]["soniox"]
 # === Helper functions ===
 def upload_file(file_path):
     headers = {"authorization": ASSEMBLYAI_API_KEY}
@@ -333,80 +329,6 @@ def detect_language(audio_url):
                 return "en"
             time.sleep(2)
 
-def format_speaker_diarization(transcription):
-    """
-    Format ElevenLabs transcription with speaker diarization.
-    Groups consecutive words by the same speaker into dialogue turns.
-    Fixes spacing and punctuation issues.
-    """
-    if not hasattr(transcription, 'words') or not transcription.words:
-        return []
-
-    formatted_lines = []
-    current_speaker = None
-    current_text = []
-
-    for word_obj in transcription.words:
-        # Skip spacing tokens if any
-        if getattr(word_obj, "type", None) == "spacing":
-            continue
-
-        speaker = getattr(word_obj, "speaker_id", None)
-        word = getattr(word_obj, "text", "")
-
-        # Speaker changed — push previous segment
-        if speaker != current_speaker:
-            if current_speaker is not None and current_text:
-                # Join words with spaces and fix spacing issues
-                text = " ".join(current_text).strip()
-                text = re.sub(r"\s+([,.!?।])", r"\1", text)  # no space before punctuation
-                text = re.sub(r"([,.!?।])([^\s])", r"\1 \2", text)  # add space after punctuation
-                speaker_label = current_speaker.replace("speaker_", "Speaker ")
-                formatted_lines.append({
-                    "speaker": speaker_label,
-                    "text": text
-                })
-            current_speaker = speaker
-            current_text = [word]
-        else:
-            current_text.append(word)
-
-    # Add the last dialogue turn
-    if current_speaker is not None and current_text:
-        text = " ".join(current_text).strip()
-        text = re.sub(r"\s+([,.!?।])", r"\1", text)
-        text = re.sub(r"([,.!?।])([^\s])", r"\1 \2", text)
-        speaker_label = current_speaker.replace("speaker_", "Speaker ")
-        formatted_lines.append({
-            "speaker": speaker_label,
-            "text": text
-        })
-
-    return formatted_lines
-
-
-def transcribe_elevenlabs(file_path, language_code):
-    """Transcribe via ElevenLabs and format speaker diarization if available."""
-    with open(file_path, "rb") as f:
-        audio_data = BytesIO(f.read())
-
-    transcription = elevenlabs.speech_to_text.convert(
-        file=audio_data,
-        model_id="scribe_v1",
-        language_code=language_code,
-        diarize=True
-    )
-
-    # Format diarization output if available
-    utterances = format_speaker_diarization(transcription)
-    
-    # Return unified result structure
-    result = {
-        "text": getattr(transcription, "text", ""),
-        "utterances": utterances
-    }
-    return result
-
 
 def transcribe(audio_url, language_code):
     """Second pass: transcribe with detected language"""
@@ -432,6 +354,132 @@ def transcribe(audio_url, language_code):
                 return {}
             time.sleep(3)
 
+def soniox_upload(filepath):
+    with httpx.Client(http2=True, timeout=None) as client:
+        with open(filepath, "rb") as f:
+            files = {"file": (os.path.basename(filepath), f, "application/octet-stream")}
+            r = client.post(
+                f"{SONIOX_BASE_URL}/files",
+                headers={"Authorization": f"Bearer {SONIOX_API_KEY}"},
+                files=files
+            )
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def soniox_transcribe(file_id, lang):
+    lang_hints = {"en":["en"], "hi":["hi","en"], "ml":["ml","en"]}.get(lang,["en"])
+
+    payload = {
+        "file_id": file_id,
+        "model": "stt-async-v3",
+        "language_hints": lang_hints,
+        "enable_speaker_diarization": True,
+        "speaker_diarization_max_speakers": 2,
+        "enable_word_timestamps": True,
+        "enable_punctuation": True
+    }
+
+    with httpx.Client(http2=True, timeout=None) as client:
+        r = client.post(
+            f"{SONIOX_BASE_URL}/transcriptions",
+            headers={
+                "Authorization": f"Bearer {SONIOX_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
+
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def soniox_poll(job_id):
+    with httpx.Client(http2=True, timeout=None) as client:
+        while True:
+            r = client.get(
+                f"{SONIOX_BASE_URL}/transcriptions/{job_id}",
+                headers={"Authorization": f"Bearer {SONIOX_API_KEY}"}
+            )
+            data = r.json()
+            print("poll:", data)
+
+            if data["status"] == "completed":
+                return
+            if data["status"] == "failed":
+                raise RuntimeError(f"Soniox failed: {data}")
+
+            time.sleep(2)
+
+def soniox_get_transcript(job_id):
+    with httpx.Client(http2=True, timeout=None) as client:
+        r = client.get(
+            f"{SONIOX_BASE_URL}/transcriptions/{job_id}/transcript",
+            headers={"Authorization": f"Bearer {SONIOX_API_KEY}"}
+        )
+    r.raise_for_status()
+    return r.json()
+
+def transcribe_soniox(file_path, lang):
+    file_id = soniox_upload(file_path)
+    job_id = soniox_transcribe(file_id, lang)
+    soniox_poll(job_id)
+
+    final = soniox_get_transcript(job_id)
+
+    tokens = final.get("tokens", [])
+    utterances = []
+    current_speaker = None
+    current_text = ""
+    start_time = None
+
+    def clean_text(txt):
+        # Fix extra spaces and punctuation spacing
+        txt = re.sub(r"\s+", " ", txt)
+        txt = re.sub(r"\s+([,.।?!])", r"\1", txt)
+        return txt.strip()
+
+    for t in tokens:
+        sp = t.get("speaker")
+        grapheme = t.get("text", "")
+
+        # Skip if token is blank
+        if grapheme is None or grapheme.strip() == "":
+            continue
+
+        # Speaker switch → close segment
+        if sp != current_speaker:
+            if current_speaker is not None and current_text.strip():
+                utterances.append({
+                    "speaker": f"Speaker {current_speaker}",
+                    "start": start_time / 1000 if start_time else None,
+                    "end": t["start_ms"] / 1000,
+                    "text": clean_text(current_text)
+                })
+            current_speaker = sp
+            current_text = grapheme
+            start_time = t["start_ms"]
+        else:
+            # 👇 Append graphemes without space unless punctuation
+            if re.match(r"[,.।?!]", grapheme):
+                current_text += grapheme
+            else:
+                current_text += grapheme  # no space between characters
+
+    # Close last segment
+    if current_speaker and current_text.strip():
+        utterances.append({
+            "speaker": f"Speaker {current_speaker}",
+            "start": start_time / 1000 if start_time else None,
+            "end": tokens[-1]["end_ms"] / 1000 if tokens else None,
+            "text": clean_text(current_text)
+        })
+
+    return {
+        "text": final.get("text", "").strip(),
+        "utterances": utterances
+    }
+
 def normalize_speakers(utterances):
     """Rename speakers to Speaker A, B, ... and remove timestamps"""
     speaker_map = {}
@@ -451,69 +499,53 @@ def normalize_speakers(utterances):
 
 def robust_sanitize_multilingual_text(raw_text: str) -> str:
     """
-    Fixes encoding issues, removes invalid characters, and normalizes Unicode.
-    Works for Tamil, Malayalam, Hindi, English mixed text.
+    Cleans and normalizes multilingual text (Tamil, Malayalam, Hindi, English).
+    Removes invalid Unicode characters and invisible artifacts.
     """
     if not raw_text:
         return ""
     
-    # Replace invalid bytes with placeholder
-    text = raw_text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-    
-    # Remove non-printable control characters (except newlines and tabs)
+    # Replace or remove problematic encodings
+    text = (
+        raw_text.encode("utf-8", errors="replace")
+        .decode("utf-8", errors="replace")
+        .replace("�", "")
+    )
+
+    # Remove control & zero-width characters
     text = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]", "", text)
-    
-    # Remove replacement symbols
-    text = text.replace("�", "")
-    
-    # Normalize Unicode to NFC form
-    text = unicodedata.normalize("NFC", text)
-    
-    # Remove invisible zero-width chars
     text = re.sub(r"[\u200B-\u200D\uFEFF]", " ", text)
     
-    # Escape special characters that might break JSON
+    # Normalize Unicode composition
+    text = unicodedata.normalize("NFC", text)
+
+    # Replace formatting controls
     text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     # Collapse redundant whitespace
     return re.sub(r"\s+", " ", text).strip()
 
+def clean_json_unicode(text: str) -> str:
+    import re, unicodedata
+    # Normalize Unicode composition
+    text = unicodedata.normalize("NFC", text)
+    # Remove control and zero-width chars
+    text = re.sub(r"[\x00-\x1F\x7F]", "", text)
+    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+    # Replace fancy quotes
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    return text
 
 def extract_json_from_text(response_text: str) -> dict:
-    """
-    Robust JSON extraction and repair for AI responses.
-    """
-    response_text = response_text.strip()
-    response_text = re.sub(r"^```(json)?", "", response_text)
-    response_text = re.sub(r"```$", "", response_text).strip()
-
-    # Try to extract the JSON block
+    response_text = clean_json_unicode(response_text.strip())
     match = re.search(r"\{[\s\S]*\}", response_text)
     json_str = match.group(0) if match else response_text
-
-    # Clean up known issues
-    json_str = (
-        json_str.replace("\\'", "'")
-        .replace('\\"', '"')
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("’", "'")
-        .replace("\n", " ")
-        .replace("\r", " ")
-        .replace("\t", " ")
-    )
-
     try:
         return json.loads(json_str)
-    except json.JSONDecodeError:
-        # Attempt minor repairs: missing commas or quotes
-        repaired = re.sub(r"(\w)\"(\w)", r'\1", "\2', json_str)
-        repaired = repaired.replace("\\", "")
-        try:
-            import json5
-            return json5.loads(repaired)
-        except Exception:
-            return {"Category": "Parse Error", "Sentiment Label": "Neutral", "Reason": "Invalid JSON returned by Claude", "Raw": json_str[:4000]}
+    except Exception:
+        import json5
+        return json5.loads(json_str)
+
 
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
@@ -588,7 +620,7 @@ Output the JSON now:"""
         else:
             json_str = response_text
 
-        result = json.loads(json_str)
+        result = extract_json_from_text(response_text)
 
         required_keys = [
             "Category",
@@ -610,9 +642,7 @@ Output the JSON now:"""
 
         if result["Sentiment Label"] not in ["Positive", "Negative", "Neutral"]:
             result["Sentiment Label"] = "Neutral"
-        
         return result
-        
     except json.JSONDecodeError as e:
         st.error(f"JSON parsing error: {e}")
         return {
@@ -636,7 +666,7 @@ Output the JSON now:"""
 
 # === Streamlit UI ===
 st.title("🎙️ Audio Transcription + Multi-Speaker Diarization")
-provider = st.selectbox("Select STT Provider", ["AssemblyAI", "ElevenLabs"])
+provider = st.selectbox("Select STT Provider", ["AssemblyAI", "Soniox"])
 st.caption("Automatic language detection → Accurate transcription with speaker identification")
 
 uploaded_file = st.file_uploader("Upload a WAV/MP3/M4A file", type=["wav", "mp3", "m4a"])
@@ -656,12 +686,12 @@ if uploaded_file:
         
         # Step 2: Detect language
         detected_language = detect_language(audio_url)
-        if provider == "AssemblyAI":
-        
+        if provider == "Soniox":
+            with st.spinner("Transcribing with Soniox..."):
+                result = soniox_get_transcript('e20cc6ee-4e09-4783-b369-a0b14e6ebeba')
+        elif provider == "AssemblyAI":
         # Step 3: Transcribe with detected language
             result = transcribe(audio_url, language_code=detected_language)
-        else:
-            result = transcribe_elevenlabs(denoised_path, detected_language)
         
         if result:
             # Display full transcription
