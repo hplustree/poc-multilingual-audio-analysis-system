@@ -117,6 +117,7 @@ def soniox_transcribe(file_id):
     payload = {
         "file_id": file_id,
         "model": "stt-async-v3",
+        "language_hints": ["hi", "en", "ml"],
         "enable_language_identification": True,
         "enable_speaker_diarization": True,
         "speaker_diarization_max_speakers": 2,
