@@ -1,3 +1,4 @@
+import zipfile
 import streamlit as st
 import requests
 import tempfile
@@ -11,6 +12,8 @@ import httpx
 import noisereduce as nr
 import soundfile as sf
 import numpy as np
+import concurrent.futures
+import pandas as pd
 
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
@@ -46,7 +49,7 @@ def denoise_audio(input_path):
         st.success("Noise reduced successfully!")
         return out_path
     except Exception as e:
-        st.warning(f"enoising failed: {e}, using original audio.")
+        st.warning(f"denoising failed: {e}, using original audio.")
         return input_path
 
 def detect_language(audio_url):
@@ -112,13 +115,14 @@ def soniox_upload(filepath):
     return r.json()["id"]
 
 
-def soniox_transcribe(file_id):
+def soniox_transcribe(file_id, detected_language):
+
+    lang_hints = {"en":["en"], "hi":["hi","en"], "ml":["ml","en"]}.get(detected_language,["en"])
 
     payload = {
         "file_id": file_id,
         "model": "stt-async-v3",
-        "language_hints": ["hi", "en", "ml"],
-        "enable_language_identification": True,
+        "language_hints": lang_hints,
         "enable_speaker_diarization": True,
         "speaker_diarization_max_speakers": 2,
         "enable_word_timestamps": True,
@@ -184,9 +188,9 @@ def soniox_delete_transcription(job_id):
             print("Warning: could not delete transcription:", r.text)
 
 
-def transcribe_soniox(file_path):
+def transcribe_soniox(file_path, detected_language):
     file_id = soniox_upload(file_path)
-    job_id = soniox_transcribe(file_id)
+    job_id = soniox_transcribe(file_id, detected_language)
     soniox_poll(job_id)
 
     final = soniox_get_transcript(job_id)
@@ -328,7 +332,7 @@ Analyze the conversation for:
 2. Main topic/category
 3. How the conversation flows between speakers
 4. Emotional progression for each speaker with transitions
-5. Speaker characteristics (mood, likely gender, approximate age)
+5. Speaker characteristics (mood, likely gender)
 6. Brief summary
 
 IMPORTANT FORMATTING RULES:
@@ -362,7 +366,7 @@ Return this exact JSON structure:
     }}
   ],
   "Speaker Analysis": [
-    {{"Speaker": "Speaker A", "Mood": "happy", "Gender": "Male", "Age": "30-40"}}
+    {{"Speaker": "Speaker A", "Mood": "happy", "Gender": "Male"}}
   ],
   "Reason": "explanation for sentiment determination",
   "Summary": "brief summary of conversation"
@@ -433,90 +437,176 @@ Output the JSON now:"""
         }
 
 # === Streamlit UI ===
-st.title("🎙️ Audio Transcription + Multi-Speaker Diarization")
+st.title("🎙️ Batch Audio Transcription + Multi-Speaker Emotion & Sentiment Analysis")
 provider = st.selectbox("Select STT Provider", ["AssemblyAI", "Soniox"])
-st.caption("Automatic language detection → Accurate transcription with speaker identification")
+st.caption("Upload a ZIP folder of audio files → automatic language detection → transcription → emotion, sentiment & speaker analysis")
+uploaded_zip = st.file_uploader("Upload a folder (as .zip)", type=["zip"])
 
-uploaded_file = st.file_uploader("Upload a WAV/MP3/M4A file", type=["wav", "mp3", "m4a"])
-
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
-        tmp.write(uploaded_file.read())
-        tmp.flush()
-        path = tmp.name
-    
+def process_audio_file(file_path, provider):
+    """Single-file pipeline using all your existing helper functions."""
     try:
-        # Step 1: Upload file
-        denoised_path = denoise_audio(path)
-        with st.spinner("⬆️ Uploading audio..."):
-            audio_url = upload_file(path)
-            st.success("✅ Upload complete!")
-        
-        # Step 2: Detect language
-        if provider == "Soniox":
-            with st.spinner("Transcribing with Soniox..."):
-                result = transcribe_soniox(denoised_path)
-        elif provider == "AssemblyAI":
-            detected_language = detect_language(audio_url)
-        # Step 3: Transcribe with detected language
-            result = transcribe(audio_url, language_code=detected_language)
-        
-        if result:
-            # Display full transcription
-            st.subheader("📄 Full Transcription")
-            full_text = result.get("text", "")
-            st.text_area("Complete Text", full_text, height=300)
+        denoised_path = denoise_audio(file_path)
+        audio_url = upload_file(denoised_path)
+        detected_language = detect_language(audio_url)
 
-            # Display speaker conversation
-            st.subheader("👥 Speaker-wise Conversation")
-            speakers = normalize_speakers(result.get("utterances", []))
-            
-            if speakers:
-                for utt in speakers:
-                    col1, col2 = st.columns([1, 5])
-                    with col1:
-                        st.markdown(f"**{utt['speaker']}**")
-                    with col2:
-                        st.write(utt['text'])
-                    st.divider()
-            else:
-                st.info("No speaker diarization data available")
+        # Transcribe
+        result = (
+            transcribe_soniox(denoised_path, detected_language)
+            if provider == "Soniox"
+            else transcribe(audio_url, language_code=detected_language)
+        )
 
-            # Claude analysis
-            if full_text:
-                st.subheader("🤖 AI Analysis: Summary & Sentiment")
-                with st.spinner("Analyzing with Claude..."):
-                    analysis = analyze_with_claude(full_text)
+        # Analyze
+        full_text = result.get("text", "")
+        analysis = analyze_with_claude(full_text) if full_text else {}
 
-        st.write("**Category:**", analysis.get("Category", "N/A"))
-        st.write("**Sentiment Score:**", analysis.get("Sentiment Score", "N/A"))
-        st.write("**Sentiment Label:**", analysis.get("Sentiment Label", "N/A"))
-        st.write("**Conversation Flow:**", analysis.get("Conversation Flow", "N/A"))
-        st.write("**Reason:**", analysis.get("Reason", "N/A"))
-        emotion_flow = analysis.get("Emotion Flow", [])
-        if isinstance(emotion_flow, list) and emotion_flow:
-            st.subheader("🧠 Emotion Flow Analysis")
-            for speaker_data in emotion_flow:
-                st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
-                for t in speaker_data.get("Transitions", []):
-                    st.write(f"• **{t['From']} → {t['To']}**")
-                    st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
-        else:
-            st.info("No detailed emotion flow available.")
+        # Include full diarization but without timestamps
+        utterances = result.get("utterances", [])
+        for utt in utterances:
+            utt.pop("start", None)
+            utt.pop("end", None)
 
-        st.subheader("Speaker Analysis")
-        speaker_analysis = analysis.get("Speaker Analysis", [])
-        if speaker_analysis:
-            for sa in speaker_analysis:
-                st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
-        else:
-            st.info("No speaker analysis available")
+        # Replace numeric speakers with readable labels directly
+        utterances = normalize_speakers(utterances)
 
-        st.subheader("Summary")
-        st.text_area("Summary", analysis.get("Summary", ""), height=200)
-                
+        return {
+            "filename": os.path.basename(file_path),
+            "language": detected_language,
+            "transcript": full_text,
+            "utterances": utterances,   # only one consistent diarization list
+            "analysis": analysis,
+            "meta": {
+                "provider": provider,
+                "detected_language": detected_language,
+                "total_segments": len(utterances),
+            },
+            "status": "success",
+        }
     except Exception as e:
-        st.error(f"❌ Error processing audio: {e}")
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
+        return {"filename": os.path.basename(file_path), "status": "error", "error": str(e)}
+
+
+# === Cache & Process Folder ===
+if uploaded_zip:
+    cache_key = f"{uploaded_zip.name}_{uploaded_zip.size}"
+
+    if "last_processed_key" not in st.session_state or st.session_state["last_processed_key"] != cache_key:
+        st.session_state["last_processed_key"] = cache_key
+        st.session_state["results"] = []
+
+        with tempfile.TemporaryDirectory() as extract_dir:
+            with zipfile.ZipFile(uploaded_zip, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+
+            # Recursive search for all audio files
+            audio_files = []
+            for root, _, files in os.walk(extract_dir):
+                for f in files:
+                    if f.lower().endswith((".wav", ".mp3", ".m4a")):
+                        audio_files.append(os.path.join(root, f))
+
+            if not audio_files:
+                st.warning("No audio files found in uploaded ZIP.")
+            else:
+                st.success(f"📂 Found {len(audio_files)} files. Starting parallel processing...")
+                progress = st.progress(0)
+                results = []
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(audio_files))) as executor:
+                    futures = {executor.submit(process_audio_file, path, provider): path for path in audio_files}
+                    total = len(futures)
+                    completed = 0
+
+                    for future in concurrent.futures.as_completed(futures):
+                        completed += 1
+                        progress.progress(completed / total)
+                        file_path = futures[future]
+                        file_name = os.path.basename(file_path)
+                        try:
+                            result = future.result()
+                            results.append(result)
+                        except Exception as e:
+                            results.append({"filename": file_name, "status": "error", "error": str(e)})
+
+                st.session_state["results"] = results
+
+    # === Display Results from Session State ===
+    results = st.session_state.get("results", [])
+    if results:
+        for result in results:
+            file_name = result["filename"]
+            if result["status"] == "success":
+                analysis = result["analysis"]
+                with st.expander(f"✅ {file_name}", expanded=False):
+                    st.write(f"**Language:** {result['language'].upper()}")
+                    st.write(f"**Provider:** {result['meta']['provider']}")
+                    st.write(f"**Segments:** {result['meta']['total_segments']}")
+
+                    st.subheader("📄 Full Transcription")
+                    st.text_area("Complete Text", result["transcript"], height=200)
+
+                    st.subheader("👥 Speaker Diarization (No Timestamps)")
+                    if result["utterances"]:
+                        for utt in result["utterances"]:
+                            st.markdown(f"**{utt['speaker']}**: {utt['text']}")
+                            st.divider()
+                    else:
+                        st.info("No speaker diarization available.")
+
+                    st.subheader("🤖 AI Analysis: Sentiment & Summary")
+                    st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
+                    st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
+                    st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
+                    st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
+                    st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
+
+                    emotion_flow = analysis.get("Emotion Flow", [])
+                    if isinstance(emotion_flow, list) and emotion_flow:
+                        st.subheader("🧠 Emotion Flow Analysis")
+                        for speaker_data in emotion_flow:
+                            st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
+                            for t in speaker_data.get("Transitions", []):
+                                st.write(f"• **{t['From']} → {t['To']}**")
+                                st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
+                    else:
+                        st.info("No detailed emotion flow available.")
+
+                    st.subheader("🗣️ Speaker Analysis (No Age)")
+                    speaker_analysis = analysis.get("Speaker Analysis", [])
+                    if speaker_analysis:
+                        for sa in speaker_analysis:
+                            st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
+                    else:
+                        st.info("No speaker analysis available.")
+
+                    st.subheader("🧾 Summary")
+                    st.text_area("Summary", analysis.get("Summary", ""), height=150)
+
+                    # Include everything (transcript, diarization, analysis) in downloadable JSON
+                    json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+                    st.download_button(
+                        label="⬇️ Download Full JSON Result",
+                        data=json_bytes,
+                        file_name=f"{os.path.splitext(file_name)[0]}_analysis.json",
+                        mime="application/json"
+                    )
+
+            else:
+                st.error(f"❌ {file_name} failed: {result.get('error', 'Unknown error')}")
+
+        # === Summary Table ===
+        success = [r for r in results if r["status"] == "success"]
+        if success:
+            df = pd.DataFrame([
+                {
+                    "File": r["filename"],
+                    "Language": r["language"],
+                    "Sentiment": r["analysis"].get("Sentiment Label", ""),
+                    "Score": r["analysis"].get("Sentiment Score", ""),
+                    "Category": r["analysis"].get("Category", ""),
+                    "Summary": r["analysis"].get("Summary", "")
+                }
+                for r in success
+            ])
+            st.subheader("📊 Summary of All Files")
+            st.dataframe(df)
