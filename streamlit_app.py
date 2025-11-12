@@ -115,14 +115,14 @@ def soniox_upload(filepath):
     return r.json()["id"]
 
 
-def soniox_transcribe(file_id, detected_language):
+def soniox_transcribe(file_id):
 
-    lang_hints = {"en":["en"], "hi":["hi","en"], "ml":["ml","en"]}.get(detected_language,["en"])
 
     payload = {
         "file_id": file_id,
         "model": "stt-async-v3",
-        "language_hints": lang_hints,
+        "language_hints": ["en","hi","ml"],
+        "enable_language_identification": True,
         "enable_speaker_diarization": True,
         "speaker_diarization_max_speakers": 2,
         "enable_word_timestamps": True,
@@ -188,9 +188,9 @@ def soniox_delete_transcription(job_id):
             print("Warning: could not delete transcription:", r.text)
 
 
-def transcribe_soniox(file_path, detected_language):
+def transcribe_soniox(file_path):
     file_id = soniox_upload(file_path)
-    job_id = soniox_transcribe(file_id, detected_language)
+    job_id = soniox_transcribe(file_id)
     soniox_poll(job_id)
 
     final = soniox_get_transcript(job_id)
@@ -451,7 +451,7 @@ def process_audio_file(file_path, provider):
 
         # Transcribe
         result = (
-            transcribe_soniox(denoised_path, detected_language)
+            transcribe_soniox(denoised_path)
             if provider == "Soniox"
             else transcribe(audio_url, language_code=detected_language)
         )
@@ -477,7 +477,6 @@ def process_audio_file(file_path, provider):
             "analysis": analysis,
             "meta": {
                 "provider": provider,
-                "detected_language": detected_language,
                 "total_segments": len(utterances),
             },
             "status": "success",
