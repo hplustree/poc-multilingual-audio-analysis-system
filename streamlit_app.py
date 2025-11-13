@@ -614,7 +614,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                     st.subheader("📄 Full Transcription")
                     st.text_area("Complete Text", result["transcript"], height=200)
 
-                    st.subheader("👥 Speaker Diarization (No Timestamps)")
+                    st.subheader("👥 Speaker Diarization")
                     if result["utterances"]:
                         for utt in result["utterances"]:
                             st.markdown(f"**{utt['speaker']}**: {utt['text']}")
