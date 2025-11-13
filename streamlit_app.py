@@ -439,22 +439,27 @@ Output the JSON now:"""
 # === Streamlit UI ===
 st.title("🎙️ Batch Audio Transcription + Multi-Speaker Emotion & Sentiment Analysis")
 provider = st.selectbox("Select STT Provider", ["AssemblyAI", "Soniox"])
-st.caption("Upload a ZIP folder of audio files → automatic language detection → transcription → emotion, sentiment & speaker analysis")
-uploaded_zip = st.file_uploader("Upload a folder (as .zip)", type=["zip"])
+st.caption(
+    "Upload either a single audio file or a ZIP folder of multiple audio files. "
+    "The system will detect the language, transcribe, and perform emotion, sentiment, and speaker analysis."
+)
+
+uploaded_file = st.file_uploader("Upload audio file or ZIP folder", type=["zip", "wav", "mp3", "m4a"])
 
 def process_audio_file(file_path, provider):
     """Single-file pipeline using all your existing helper functions."""
     try:
         denoised_path = denoise_audio(file_path)
         audio_url = upload_file(denoised_path)
-        detected_language = detect_language(audio_url)
 
         # Transcribe
-        result = (
-            transcribe_soniox(denoised_path)
-            if provider == "Soniox"
-            else transcribe(audio_url, language_code=detected_language)
-        )
+        if provider == "Soniox":
+            with st.spinner("🎧 Transcribing with Soniox..."):
+                result = transcribe_soniox(denoised_path)
+        else:
+            detected_language = detect_language(audio_url)
+            with st.spinner(f"📝 Transcribing with AssemblyAI in {detected_language.upper()}..."):
+                result = transcribe(audio_url, language_code=detected_language)
 
         # Analyze
         full_text = result.get("text", "")
@@ -486,18 +491,84 @@ def process_audio_file(file_path, provider):
 
 
 # === Cache & Process Folder ===
-if uploaded_zip:
-    cache_key = f"{uploaded_zip.name}_{uploaded_zip.size}"
+if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a")):
+    st.info(f"🎧 Processing single file: **{uploaded_file.name}** ...")
+
+    # Save uploaded file to temp
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+        tmp.write(uploaded_file.read())
+        temp_audio_path = tmp.name
+
+    result = process_audio_file(temp_audio_path, provider)
+
+    if result["status"] == "success":
+        analysis = result["analysis"]
+        st.success("✅ File processed successfully!")
+
+        st.subheader("📄 Full Transcription")
+        st.text_area("Complete Text", result["transcript"], height=200)
+
+        st.subheader("👥 Speaker Diarization")
+        if result["utterances"]:
+            for utt in result["utterances"]:
+                st.markdown(f"**{utt['speaker']}**: {utt['text']}")
+                st.divider()
+        else:
+            st.info("No speaker diarization available.")
+
+        st.subheader("🤖 AI Analysis: Sentiment & Summary")
+        st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
+        st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
+        st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
+        st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
+        st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
+
+        emotion_flow = analysis.get("Emotion Flow", [])
+        if isinstance(emotion_flow, list) and emotion_flow:
+            st.subheader("🧠 Emotion Flow Analysis")
+            for speaker_data in emotion_flow:
+                st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
+                for t in speaker_data.get("Transitions", []):
+                    st.write(f"• **{t['From']} → {t['To']}**")
+                    st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
+        else:
+            st.info("No detailed emotion flow available.")
+
+        st.subheader("🗣️ Speaker Analysis (No Age)")
+        speaker_analysis = analysis.get("Speaker Analysis", [])
+        if speaker_analysis:
+            for sa in speaker_analysis:
+                st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
+        else:
+            st.info("No speaker analysis available.")
+
+        st.subheader("🧾 Summary")
+        st.text_area("Summary", analysis.get("Summary", ""), height=150)
+
+        json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+        st.download_button(
+            label="⬇️ Download Full JSON Result",
+            data=json_bytes,
+            file_name=f"{os.path.splitext(uploaded_file.name)[0]}_analysis.json",
+            mime="application/json"
+        )
+    else:
+        st.error(f"❌ Processing failed: {result.get('error', 'Unknown error')}")
+
+# === Process ZIP of Multiple Files ===
+elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
+    st.info("📦 ZIP file detected — processing multiple audio files in parallel...")
+    cache_key = f"{uploaded_file.name}_{uploaded_file.size}"
 
     if "last_processed_key" not in st.session_state or st.session_state["last_processed_key"] != cache_key:
         st.session_state["last_processed_key"] = cache_key
         st.session_state["results"] = []
 
         with tempfile.TemporaryDirectory() as extract_dir:
-            with zipfile.ZipFile(uploaded_zip, "r") as zip_ref:
+            with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
                 zip_ref.extractall(extract_dir)
 
-            # Recursive search for all audio files
+            # Find all audio files
             audio_files = []
             for root, _, files in os.walk(extract_dir):
                 for f in files:
@@ -505,7 +576,7 @@ if uploaded_zip:
                         audio_files.append(os.path.join(root, f))
 
             if not audio_files:
-                st.warning("No audio files found in uploaded ZIP.")
+                st.warning("No audio files found in ZIP.")
             else:
                 st.success(f"📂 Found {len(audio_files)} files. Starting parallel processing...")
                 progress = st.progress(0)
@@ -529,9 +600,10 @@ if uploaded_zip:
 
                 st.session_state["results"] = results
 
-    # === Display Results from Session State ===
+    # Display results
     results = st.session_state.get("results", [])
     if results:
+        st.success("✅ All files processed successfully!")
         for result in results:
             file_name = result["filename"]
             if result["status"] == "success":
@@ -549,8 +621,6 @@ if uploaded_zip:
                         for utt in result["utterances"]:
                             st.markdown(f"**{utt['speaker']}**: {utt['text']}")
                             st.divider()
-                    else:
-                        st.info("No speaker diarization available.")
 
                     st.subheader("🤖 AI Analysis: Sentiment & Summary")
                     st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
@@ -559,29 +629,9 @@ if uploaded_zip:
                     st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
                     st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
 
-                    emotion_flow = analysis.get("Emotion Flow", [])
-                    if isinstance(emotion_flow, list) and emotion_flow:
-                        st.subheader("🧠 Emotion Flow Analysis")
-                        for speaker_data in emotion_flow:
-                            st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
-                            for t in speaker_data.get("Transitions", []):
-                                st.write(f"• **{t['From']} → {t['To']}**")
-                                st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
-                    else:
-                        st.info("No detailed emotion flow available.")
-
-                    st.subheader("🗣️ Speaker Analysis (No Age)")
-                    speaker_analysis = analysis.get("Speaker Analysis", [])
-                    if speaker_analysis:
-                        for sa in speaker_analysis:
-                            st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
-                    else:
-                        st.info("No speaker analysis available.")
-
                     st.subheader("🧾 Summary")
                     st.text_area("Summary", analysis.get("Summary", ""), height=150)
 
-                    # Include everything (transcript, diarization, analysis) in downloadable JSON
                     json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
                     st.download_button(
                         label="⬇️ Download Full JSON Result",
@@ -593,7 +643,7 @@ if uploaded_zip:
             else:
                 st.error(f"❌ {file_name} failed: {result.get('error', 'Unknown error')}")
 
-        # === Summary Table ===
+        # Combined Summary
         success = [r for r in results if r["status"] == "success"]
         if success:
             df = pd.DataFrame([
@@ -609,3 +659,6 @@ if uploaded_zip:
             ])
             st.subheader("📊 Summary of All Files")
             st.dataframe(df)
+
+else:
+    st.info("👆 Please upload either a single audio file or a ZIP folder to begin processing.")
