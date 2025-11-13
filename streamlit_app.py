@@ -608,7 +608,6 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
             if result["status"] == "success":
                 analysis = result["analysis"]
                 with st.expander(f"✅ {file_name}", expanded=False):
-                    st.write(f"**Language:** {result['language'].upper()}")
                     st.write(f"**Provider:** {result['meta']['provider']}")
                     st.write(f"**Segments:** {result['meta']['total_segments']}")
 
@@ -648,7 +647,6 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
             df = pd.DataFrame([
                 {
                     "File": r["filename"],
-                    "Language": r["language"],
                     "Sentiment": r["analysis"].get("Sentiment Label", ""),
                     "Score": r["analysis"].get("Sentiment Score", ""),
                     "Category": r["analysis"].get("Category", ""),
