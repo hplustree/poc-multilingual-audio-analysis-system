@@ -476,7 +476,6 @@ def process_audio_file(file_path, provider):
 
         return {
             "filename": os.path.basename(file_path),
-            "language": detected_language,
             "transcript": full_text,
             "utterances": utterances,   # only one consistent diarization list
             "analysis": analysis,
