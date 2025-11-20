@@ -492,6 +492,8 @@ def process_audio_file(file_path, provider):
 
 # === Cache & Process Folder ===
 if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a")):
+    st.session_state.pop("results", None)
+    st.session_state.pop("last_processed_key", None)
     st.info(f"🎧 Processing single file: **{uploaded_file.name}** ...")
 
     # Save uploaded file to temp
@@ -506,11 +508,12 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
         st.success("✅ File processed successfully!")
 
         st.subheader("📄 Full Transcription")
+        single_key = f"single_{uploaded_file.name}_{uploaded_file.size}"
         st.text_area(
             "Complete Text",
             result["transcript"],
             height=200,
-            key="complete_text_single"
+            key=f"complete_text_{single_key}"
         )
 
         st.subheader("👥 Speaker Diarization")
@@ -552,7 +555,7 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
             "Summary",
             analysis.get("Summary", ""),
             height=150,
-            key="summary_single"
+            key=f"summary_{single_key}"
         )
 
         json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
@@ -561,7 +564,7 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
             data=json_bytes,
             file_name=f"{os.path.splitext(uploaded_file.name)[0]}_analysis.json",
             mime="application/json",
-            key=f"download_single_{uploaded_file.name}"
+            key=f"download_single_{single_key}"
         )
     else:
         st.error(f"❌ Processing failed: {result.get('error', 'Unknown error')}")
