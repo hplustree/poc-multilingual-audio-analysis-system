@@ -584,7 +584,9 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
             for root, _, files in os.walk(extract_dir):
                 for f in files:
                     if f.lower().endswith((".wav", ".mp3", ".m4a")):
-                        audio_files.append(os.path.join(root, f))
+                        abs_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(abs_path, extract_dir)
+                        audio_files.append({"abs": abs_path, "rel": rel_path})
 
             if not audio_files:
                 st.warning("No audio files found in ZIP.")
@@ -594,17 +596,24 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                 results = []
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(audio_files))) as executor:
-                    futures = {executor.submit(process_audio_file, path, provider): path for path in audio_files}
+                    futures = {
+                        executor.submit(process_audio_file, item["abs"], provider): item
+                        for item in audio_files
+                    }
                     total = len(futures)
                     completed = 0
 
                     for future in concurrent.futures.as_completed(futures):
                         completed += 1
                         progress.progress(completed / total)
-                        file_path = futures[future]
-                        file_name = os.path.basename(file_path)
+                        item = futures[future]
+                        rel = item["rel"]
+                        abs_path = item["abs"]
+                        file_name = os.path.basename(abs_path)
+
                         try:
                             result = future.result()
+                            result["rel_path"] = rel
                             results.append(result)
                         except Exception as e:
                             results.append({"filename": file_name, "status": "error", "error": str(e)})
@@ -619,7 +628,9 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
             file_name = result["filename"]
             if result["status"] == "success":
                 analysis = result["analysis"]
-                with st.expander(f"✅ {file_name}", expanded=False):
+                rel = result.get("rel_path", file_name)
+                safe = rel.replace(os.sep, "__")
+                with st.expander(f"✅ {rel}", expanded=False):
                     st.write(f"**Provider:** {result['meta']['provider']}")
                     st.write(f"**Segments:** {result['meta']['total_segments']}")
 
@@ -628,7 +639,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         "Complete Text",
                         result["transcript"],
                         height=200,
-                        key=f"complete_text_{result['filepath']}"
+                        key=f"complete_text_{safe}"
                     )
 
                     st.subheader("👥 Speaker Diarization")
@@ -667,7 +678,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         "Summary",
                         analysis.get("Summary", ""),
                         height=150,
-                        key=f"summary_{result['filepath']}"
+                        key=f"summary_{safe}"
                     )
 
                     json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
@@ -676,7 +687,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         data=json_bytes,
                         file_name=f"{os.path.splitext(file_name)[0]}_analysis.json",
                         mime="application/json",
-                         key=f"download_zip_{result['filepath']}"
+                         key=f"download_zip_{safe}"
                     )
 
             else:
