@@ -476,6 +476,7 @@ def process_audio_file(file_path, provider):
 
         return {
             "filename": os.path.basename(file_path),
+            "filepath": file_path,
             "transcript": full_text,
             "utterances": utterances,   # only one consistent diarization list
             "analysis": analysis,
@@ -559,7 +560,8 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
             label="⬇️ Download Full JSON Result",
             data=json_bytes,
             file_name=f"{os.path.splitext(uploaded_file.name)[0]}_analysis.json",
-            mime="application/json"
+            mime="application/json",
+            key=f"download_single_{uploaded_file.name}"
         )
     else:
         st.error(f"❌ Processing failed: {result.get('error', 'Unknown error')}")
@@ -626,7 +628,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         "Complete Text",
                         result["transcript"],
                         height=200,
-                        key=f"complete_text_{file_name}"
+                        key=f"complete_text_{result['filepath']}"
                     )
 
                     st.subheader("👥 Speaker Diarization")
@@ -665,7 +667,7 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         "Summary",
                         analysis.get("Summary", ""),
                         height=150,
-                        key=f"summary_{file_name}"
+                        key=f"summary_{result['filepath']}"
                     )
 
                     json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
@@ -673,7 +675,8 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         label="⬇️ Download Full JSON Result",
                         data=json_bytes,
                         file_name=f"{os.path.splitext(file_name)[0]}_analysis.json",
-                        mime="application/json"
+                        mime="application/json",
+                         key=f"download_zip_{result['filepath']}"
                     )
 
             else:
