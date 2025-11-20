@@ -505,7 +505,12 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
         st.success("✅ File processed successfully!")
 
         st.subheader("📄 Full Transcription")
-        st.text_area("Complete Text", result["transcript"], height=200)
+        st.text_area(
+            "Complete Text",
+            result["transcript"],
+            height=200,
+            key="complete_text_single"
+        )
 
         st.subheader("👥 Speaker Diarization")
         if result["utterances"]:
@@ -542,7 +547,12 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
             st.info("No speaker analysis available.")
 
         st.subheader("🧾 Summary")
-        st.text_area("Summary", analysis.get("Summary", ""), height=150)
+        st.text_area(
+            "Summary",
+            analysis.get("Summary", ""),
+            height=150,
+            key="summary_single"
+        )
 
         json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
         st.download_button(
@@ -612,7 +622,12 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                     st.write(f"**Segments:** {result['meta']['total_segments']}")
 
                     st.subheader("📄 Full Transcription")
-                    st.text_area("Complete Text", result["transcript"], height=200)
+                    st.text_area(
+                        "Complete Text",
+                        result["transcript"],
+                        height=200,
+                        key=f"complete_text_{file_name}"
+                    )
 
                     st.subheader("👥 Speaker Diarization")
                     if result["utterances"]:
@@ -626,9 +641,32 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                     st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
                     st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
                     st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
+                    emotion_flow = analysis.get("Emotion Flow", [])
+                    if isinstance(emotion_flow, list) and emotion_flow:
+                        st.subheader("🧠 Emotion Flow Analysis")
+                        for speaker_data in emotion_flow:
+                            st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
+                            for t in speaker_data.get("Transitions", []):
+                                st.write(f"• **{t['From']} → {t['To']}**")
+                                st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
+                    else:
+                        st.info("No detailed emotion flow available.")
+
+                    st.subheader("🗣️ Speaker Analysis")
+                    speaker_analysis = analysis.get("Speaker Analysis", [])
+                    if speaker_analysis:
+                        for sa in speaker_analysis:
+                            st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
+                    else:
+                        st.info("No speaker analysis available.")
 
                     st.subheader("🧾 Summary")
-                    st.text_area("Summary", analysis.get("Summary", ""), height=150)
+                    st.text_area(
+                        "Summary",
+                        analysis.get("Summary", ""),
+                        height=150,
+                        key=f"summary_{file_name}"
+                    )
 
                     json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
                     st.download_button(
