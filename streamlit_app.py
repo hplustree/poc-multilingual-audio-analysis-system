@@ -383,16 +383,75 @@ def clean_json_unicode(text: str) -> str:
     # Replace fancy quotes
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
     return text
-
 def extract_json_from_text(response_text: str) -> dict:
-    response_text = clean_json_unicode(response_text.strip())
-    match = re.search(r"\{[\s\S]*\}", response_text)
-    json_str = match.group(0) if match else response_text
+    import json5
+    text = clean_json_unicode(response_text.strip())
+
+    # Extract JSON block
+    match = re.search(r"\{[\s\S]*", text)
+    if not match:
+        return {}
+
+    json_str = match.group(0)
+
+    # 1. Try parsing raw JSON with json5
     try:
-        return json.loads(json_str)
-    except Exception:
-        import json5
         return json5.loads(json_str)
+    except Exception:
+        pass
+
+    # -----------------------------
+    # 2. JSON REPAIR STAGE (very important)
+    # -----------------------------
+    repaired = json_str
+
+    # Remove trailing commas (VERY common cause of json5 failure too)
+    repaired = re.sub(r",\s*}", "}", repaired)
+    repaired = re.sub(r",\s*]", "]", repaired)
+
+    # Fix unbalanced braces { }
+    open_braces = repaired.count("{")
+    close_braces = repaired.count("}")
+    if close_braces < open_braces:
+        repaired += "}" * (open_braces - close_braces)
+
+    # Fix unbalanced brackets [ ]
+    open_brackets = repaired.count("[")
+    close_brackets = repaired.count("]")
+    if close_brackets < open_brackets:
+        repaired += "]" * (open_brackets - close_brackets)
+
+    # Try json5 again after repair
+    try:
+        return json5.loads(repaired)
+    except Exception:
+        pass
+
+    # -----------------------------
+    # 3. FINAL FALLBACK — partial extraction
+    # -----------------------------
+    partial = {}
+
+    fields = [
+        "Category",
+        "Sentiment Score",
+        "Sentiment Label",
+        "Conversation Flow",
+        "Reason",
+        "Summary",
+    ]
+
+    for f in fields:
+        m = re.search(rf'"{f}"\s*:\s*"([^"]*)"', json_str)
+        if m:
+            partial[f] = m.group(1)
+
+    # Fill defaults for missing entries
+    for f in fields:
+        partial.setdefault(f, "")
+
+    return partial
+
 
 @retry_api(extra_delay=2)
 def analyze_with_claude(text):
