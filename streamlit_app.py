@@ -454,6 +454,7 @@ Output the JSON now:"""
     try:
         response = client.messages.create(
             model="claude-haiku-4-5",
+            max_tokens=8000,
             temperature=0,
             messages=[{"role": "user", "content": prompt}]
         )
