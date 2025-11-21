@@ -1,3 +1,4 @@
+from functools import wraps
 import zipfile
 import streamlit as st
 import requests
@@ -14,7 +15,8 @@ import soundfile as sf
 import numpy as np
 import concurrent.futures
 import pandas as pd
-
+import threading
+import queue
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
 UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
@@ -24,6 +26,79 @@ client = Anthropic(api_key=CLAUDE_API_KEY)
 SONIOX_BASE_URL = "https://api.soniox.com/v1"
 SONIOX_API_KEY= st.secrets["api_keys"]["soniox"]
 # === Helper functions ===
+
+
+# === Claude Queue (Safe Rate-Limited Worker) ===
+CLAUDE_MIN_DELAY = 13
+claude_queue = queue.Queue()
+
+def claude_worker():
+    """
+    Dedicated worker that processes Claude API requests sequentially.
+    Ensures we never exceed Anthropic rate limits.
+    """
+    last_call_time = 0
+
+    while True:
+        item = claude_queue.get()
+
+        if item is None:
+            break  # stop thread
+
+        text, callback = item
+
+        # Enforce safe spacing between API calls
+        elapsed = time.time() - last_call_time
+        if elapsed < CLAUDE_MIN_DELAY:
+            time.sleep(CLAUDE_MIN_DELAY - elapsed)
+
+        result = analyze_with_claude(text)  # <-- your existing function
+        last_call_time = time.time()
+
+        # Return result to waiting thread
+        callback(result)
+        claude_queue.task_done()
+
+# Start worker thread
+threading.Thread(target=claude_worker, daemon=True).start()
+
+def retry_api(max_retries=5, base_delay=1, backoff=2, extra_delay=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            while attempt < max_retries:
+                # Slow down EVERY request to avoid rate-limit
+                if extra_delay > 0:
+                    time.sleep(extra_delay)
+
+                try:
+                    return func(*args, **kwargs)
+
+                except Exception as e:
+                    err_msg = str(e)
+                    retryable = (
+                        "429" in err_msg or
+                        "rate limit" in err_msg.lower() or
+                        "503" in err_msg or
+                        "500" in err_msg or
+                        isinstance(e, httpx.HTTPError) or
+                        isinstance(e, requests.exceptions.RequestException)
+                    )
+
+                    if not retryable:
+                        raise
+
+                    attempt += 1
+                    wait = base_delay * (backoff ** (attempt - 1))
+                    st.warning(f"⏳ Retry {attempt}/{max_retries}: {err_msg}. Waiting {wait:.1f}s...")
+                    time.sleep(wait)
+
+            raise RuntimeError(f"API failed after {max_retries} retries")
+        return wrapper
+    return decorator
+
+@retry_api(extra_delay=1)
 def upload_file(file_path):
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     with open(file_path, "rb") as f:
@@ -52,6 +127,7 @@ def denoise_audio(input_path):
         st.warning(f"denoising failed: {e}, using original audio.")
         return input_path
 
+@retry_api(extra_delay=1)
 def detect_language(audio_url):
     """First pass: detect the dominant language"""
     headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
@@ -77,7 +153,7 @@ def detect_language(audio_url):
                 return "en"
             time.sleep(2)
 
-
+@retry_api(extra_delay=1)
 def transcribe(audio_url, language_code):
     """Second pass: transcribe with detected language"""
     headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
@@ -102,6 +178,7 @@ def transcribe(audio_url, language_code):
                 return {}
             time.sleep(3)
 
+@retry_api(extra_delay=1)
 def soniox_upload(filepath):
     with httpx.Client(http2=True, timeout=None) as client:
         with open(filepath, "rb") as f:
@@ -114,7 +191,7 @@ def soniox_upload(filepath):
     r.raise_for_status()
     return r.json()["id"]
 
-
+@retry_api(extra_delay=1)
 def soniox_transcribe(file_id):
 
 
@@ -232,11 +309,10 @@ def transcribe_soniox(file_path):
             current_text = grapheme
             start_time = t["start_ms"]
         else:
-            # 👇 Append graphemes without space unless punctuation
             if re.match(r"[,.।?!]", grapheme):
                 current_text += grapheme
             else:
-                current_text += grapheme  # no space between characters
+                current_text += grapheme
 
     # Close last segment
     if current_speaker and current_text.strip():
@@ -318,7 +394,7 @@ def extract_json_from_text(response_text: str) -> dict:
         import json5
         return json5.loads(json_str)
 
-
+@retry_api(extra_delay=2)
 def analyze_with_claude(text):
     sanitized_text = robust_sanitize_multilingual_text(text)
     prompt = f"""Analyze this conversation and return your analysis as a JSON object.
@@ -377,7 +453,7 @@ Output the JSON now:"""
 
     try:
         response = client.messages.create(
-            model="claude-3-7-sonnet-20250219",
+            model="claude-haiku-4-5",
             max_tokens=1024,
             temperature=0,
             messages=[{"role": "user", "content": prompt}]
@@ -463,7 +539,19 @@ def process_audio_file(file_path, provider):
 
         # Analyze
         full_text = result.get("text", "")
-        analysis = analyze_with_claude(full_text) if full_text else {}
+        analysis_container = {"value": None}
+        event = threading.Event()
+
+        def on_done(result):
+            analysis_container["value"] = result
+            event.set()
+
+        if full_text:
+            # enqueue safely
+            claude_queue.put((full_text, on_done))
+            event.wait()  # wait for Claude result
+
+        analysis = analysis_container["value"] if full_text else {}
 
         # Include full diarization but without timestamps
         utterances = result.get("utterances", [])
@@ -478,7 +566,7 @@ def process_audio_file(file_path, provider):
             "filename": os.path.basename(file_path),
             "filepath": file_path,
             "transcript": full_text,
-            "utterances": utterances,   # only one consistent diarization list
+            "utterances": utterances,
             "analysis": analysis,
             "meta": {
                 "provider": provider,
@@ -599,10 +687,12 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                 results = []
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(audio_files))) as executor:
-                    futures = {
-                        executor.submit(process_audio_file, item["abs"], provider): item
-                        for item in audio_files
-                    }
+                    futures = {}
+                    for item in audio_files:
+                        time.sleep(1)
+                        fut = executor.submit(process_audio_file, item["abs"], provider)
+                        futures[fut] = item
+
                     total = len(futures)
                     completed = 0
 
@@ -613,90 +703,96 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                         rel = item["rel"]
                         abs_path = item["abs"]
                         file_name = os.path.basename(abs_path)
-
+                        safe = rel.replace(os.sep, "__")
                         try:
                             result = future.result()
                             result["rel_path"] = rel
+
                             results.append(result)
+                            st.session_state["results"] = results
+
+                            if result["status"] == "success":
+                                analysis = result["analysis"]
+
+                                with st.expander(f"✅ {rel}", expanded=False):
+                                    st.write(f"**Provider:** {result['meta']['provider']}")
+                                    st.write(f"**Segments:** {result['meta']['total_segments']}")
+
+                                    st.subheader("📄 Full Transcription")
+                                    st.text_area(
+                                        "Complete Text",
+                                        result["transcript"],
+                                        height=200,
+                                        key=f"complete_text_{safe}"
+                                    )
+                                    st.subheader("👥 Speaker Diarization")
+                                    if result["utterances"]:
+                                        for utt in result["utterances"]:
+                                            st.markdown(f"**{utt['speaker']}**: {utt['text']}")
+                                            st.divider()
+                                    else:
+                                        st.info("No speaker diarization available.")
+
+                                    st.subheader("🤖 AI Analysis: Sentiment & Summary")
+                                    st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
+                                    st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
+                                    st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
+                                    st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
+                                    st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
+
+                                    emotion_flow = analysis.get("Emotion Flow", [])
+                                    if isinstance(emotion_flow, list) and emotion_flow:
+                                        st.subheader("🧠 Emotion Flow Analysis")
+                                        for speaker_data in emotion_flow:
+                                            st.markdown(
+                                                f"**{speaker_data['Speaker']}**: "
+                                                f"{' → '.join(speaker_data.get('Emotions', []))}"
+                                            )
+                                            for t in speaker_data.get("Transitions", []):
+                                                st.write(f"• **{t['From']} → {t['To']}**")
+                                                st.caption(
+                                                    f"_How:_ {t['How']} | "
+                                                    f"_Why:_ {t['Why']} | "
+                                                    f"_Where:_ {t['Where']}"
+                                                )
+                                    else:
+                                        st.info("No detailed emotion flow available.")
+
+                                    st.subheader("🗣️ Speaker Analysis")
+                                    speaker_analysis = analysis.get("Speaker Analysis", [])
+                                    if speaker_analysis:
+                                        for sa in speaker_analysis:
+                                            st.write(
+                                                f"{sa['Speaker']} → "
+                                                f"Mood: {sa.get('Mood', 'N/A')}, "
+                                                f"Gender: {sa.get('Gender', 'N/A')}"
+                                            )
+                                    else:
+                                        st.info("No speaker analysis available.")
+
+                                    st.subheader("🧾 Summary")
+                                    st.text_area(
+                                        "Summary",
+                                        analysis.get("Summary", ""),
+                                        height=150,
+                                        key=f"summary_{safe}"
+                                    )
+
+                                    json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+                                    st.download_button(
+                                        label="⬇️ Download Full JSON Result",
+                                        data=json_bytes,
+                                        file_name=f"{os.path.splitext(file_name)[0]}_analysis.json",
+                                        mime="application/json",
+                                        key=f"download_zip_{safe}"
+                                    )
+
+                            else:
+                                st.error(f"❌ {rel} failed: {result.get('error', 'Unknown error')}")
+
                         except Exception as e:
-                            results.append({"filename": file_name, "status": "error", "error": str(e)})
+                            st.error(f"❌ {rel} crashed: {str(e)}")
 
-                st.session_state["results"] = results
-
-    # Display results
-    results = st.session_state.get("results", [])
-    if results:
-        st.success("✅ All files processed successfully!")
-        for result in results:
-            file_name = result["filename"]
-            if result["status"] == "success":
-                analysis = result["analysis"]
-                rel = result.get("rel_path", file_name)
-                safe = rel.replace(os.sep, "__")
-                with st.expander(f"✅ {rel}", expanded=False):
-                    st.write(f"**Provider:** {result['meta']['provider']}")
-                    st.write(f"**Segments:** {result['meta']['total_segments']}")
-
-                    st.subheader("📄 Full Transcription")
-                    st.text_area(
-                        "Complete Text",
-                        result["transcript"],
-                        height=200,
-                        key=f"complete_text_{safe}"
-                    )
-
-                    st.subheader("👥 Speaker Diarization")
-                    if result["utterances"]:
-                        for utt in result["utterances"]:
-                            st.markdown(f"**{utt['speaker']}**: {utt['text']}")
-                            st.divider()
-
-                    st.subheader("🤖 AI Analysis: Sentiment & Summary")
-                    st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
-                    st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
-                    st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
-                    st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
-                    st.write(f"**Reason:** {analysis.get('Reason', 'N/A')}")
-                    emotion_flow = analysis.get("Emotion Flow", [])
-                    if isinstance(emotion_flow, list) and emotion_flow:
-                        st.subheader("🧠 Emotion Flow Analysis")
-                        for speaker_data in emotion_flow:
-                            st.markdown(f"**{speaker_data['Speaker']}**: {' → '.join(speaker_data.get('Emotions', []))}")
-                            for t in speaker_data.get("Transitions", []):
-                                st.write(f"• **{t['From']} → {t['To']}**")
-                                st.caption(f"_How:_ {t['How']} | _Why:_ {t['Why']} | _Where:_ {t['Where']}")
-                    else:
-                        st.info("No detailed emotion flow available.")
-
-                    st.subheader("🗣️ Speaker Analysis")
-                    speaker_analysis = analysis.get("Speaker Analysis", [])
-                    if speaker_analysis:
-                        for sa in speaker_analysis:
-                            st.write(f"{sa['Speaker']} → Mood: {sa.get('Mood','N/A')}, Gender: {sa.get('Gender','N/A')}")
-                    else:
-                        st.info("No speaker analysis available.")
-
-                    st.subheader("🧾 Summary")
-                    st.text_area(
-                        "Summary",
-                        analysis.get("Summary", ""),
-                        height=150,
-                        key=f"summary_{safe}"
-                    )
-
-                    json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
-                    st.download_button(
-                        label="⬇️ Download Full JSON Result",
-                        data=json_bytes,
-                        file_name=f"{os.path.splitext(file_name)[0]}_analysis.json",
-                        mime="application/json",
-                         key=f"download_zip_{safe}"
-                    )
-
-            else:
-                st.error(f"❌ {file_name} failed: {result.get('error', 'Unknown error')}")
-
-        # Combined Summary
         success = [r for r in results if r["status"] == "success"]
         if success:
             df = pd.DataFrame([
