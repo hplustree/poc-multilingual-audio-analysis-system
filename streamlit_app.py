@@ -17,6 +17,7 @@ import concurrent.futures
 import pandas as pd
 import threading
 import queue
+import whisper
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
 UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
@@ -24,9 +25,16 @@ TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 CLAUDE_API_KEY = st.secrets["api_keys"]["anthropic"]
 client = Anthropic(api_key=CLAUDE_API_KEY)
 SONIOX_BASE_URL = "https://api.soniox.com/v1"
+
 SONIOX_API_KEY= st.secrets["api_keys"]["soniox"]
 # === Helper functions ===
-
+if "zip_state" not in st.session_state:
+    st.session_state["zip_state"] = {
+        "status": "idle",
+        "results": [],
+        "total": 0,
+        "futures": None
+    }
 
 # === Claude Queue (Safe Rate-Limited Worker) ===
 CLAUDE_MIN_DELAY = 13
@@ -192,7 +200,7 @@ def soniox_upload(filepath):
     return r.json()["id"]
 
 @retry_api(extra_delay=1)
-def soniox_transcribe(file_id):
+def soniox_transcribe(file_id, lang_hints = None):
 
 
     payload = {
@@ -205,6 +213,8 @@ def soniox_transcribe(file_id):
         "enable_word_timestamps": True,
         "enable_punctuation": True
     }
+    if lang_hints:
+        payload["language_hints"] = [lang_hints]
 
     with httpx.Client(http2=True, timeout=None) as client:
         r = client.post(
@@ -265,9 +275,9 @@ def soniox_delete_transcription(job_id):
             print("Warning: could not delete transcription:", r.text)
 
 
-def transcribe_soniox(file_path):
+def transcribe_soniox(file_path, lang_hints = None):
     file_id = soniox_upload(file_path)
-    job_id = soniox_transcribe(file_id)
+    job_id = soniox_transcribe(file_id, lang_hints=lang_hints)
     soniox_poll(job_id)
 
     final = soniox_get_transcript(job_id)
@@ -327,6 +337,31 @@ def transcribe_soniox(file_path):
         "text": final.get("text", "").strip(),
         "utterances": utterances
     }
+@st.cache_resource
+def load_whisper_small_model():
+    return whisper.load_model("small")
+
+def detect_language_whisper(file_path):
+    st.info("🌍 Detecting language (Whisper Small)...")
+
+    try:
+        whisper_model = load_whisper_small_model()
+        audio = whisper.load_audio(file_path)
+        audio = whisper.pad_or_trim(audio)
+
+        mel = whisper.log_mel_spectrogram(audio).to(whisper_model.device)
+        _, probs = whisper_model.detect_language(mel)
+        detected_lang = max(probs, key=probs.get)
+        confidence = probs[detected_lang]
+
+        st.success(f"Detected Language: **{detected_lang.upper()}** ({confidence:.2f})")
+
+        return detected_lang, confidence
+
+    except Exception as e:
+        st.warning(f"Whisper Small detection failed: {e}. Defaulting to English.")
+        return "en", 0.5
+
 
 def normalize_speakers(utterances):
     """Rename speakers to Speaker A, B, ... and remove timestamps"""
@@ -426,10 +461,6 @@ def extract_json_from_text(response_text: str) -> dict:
         return json5.loads(repaired)
     except Exception:
         pass
-
-    # -----------------------------
-    # 3. FINAL FALLBACK — partial extraction
-    # -----------------------------
     partial = {}
 
     fields = [
@@ -579,7 +610,7 @@ st.caption(
     "The system will detect the language, transcribe, and perform emotion, sentiment, and speaker analysis."
 )
 
-uploaded_file = st.file_uploader("Upload audio file or ZIP folder", type=["zip", "wav", "mp3", "m4a"])
+uploaded_file = st.file_uploader("Upload audio file or ZIP folder", type=["zip", "wav", "mp3", "m4a"], key="uploader")
 
 def process_audio_file(file_path, provider):
     """Single-file pipeline using all your existing helper functions."""
@@ -590,9 +621,11 @@ def process_audio_file(file_path, provider):
         # Transcribe
         if provider == "Soniox":
             with st.spinner("🎧 Transcribing with Soniox..."):
-                result = transcribe_soniox(denoised_path)
+                detected_language, lang_conf = detect_language_whisper(denoised_path)
+                result = transcribe_soniox(denoised_path, detected_language)
         else:
             detected_language = detect_language(audio_url)
+            lang_conf = None
             with st.spinner(f"📝 Transcribing with AssemblyAI in {detected_language.upper()}..."):
                 result = transcribe(audio_url, language_code=detected_language)
 
@@ -630,6 +663,8 @@ def process_audio_file(file_path, provider):
             "meta": {
                 "provider": provider,
                 "total_segments": len(utterances),
+                "detected_language": detected_language,
+                "detected_language_confidence": lang_conf
             },
             "status": "success",
         }
@@ -653,6 +688,13 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
     if result["status"] == "success":
         analysis = result["analysis"]
         st.success("✅ File processed successfully!")
+        st.write(
+            f"**Detected Language:** {result['meta']['detected_language'].upper()} "
+        )
+        if result['meta'].get('detected_language_confidence'):
+            st.caption(
+                f"Confidence: {result['meta']['detected_language_confidence']:.2f}"
+            )
 
         st.subheader("📄 Full Transcription")
         single_key = f"single_{uploaded_file.name}_{uploaded_file.size}"
@@ -776,13 +818,15 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                                 with st.expander(f"✅ {rel}", expanded=False):
                                     st.write(f"**Provider:** {result['meta']['provider']}")
                                     st.write(f"**Segments:** {result['meta']['total_segments']}")
-
+                                    st.write(f"**Detected Language:** {result['meta']['detected_language'].upper()}")
+                                    if result['meta'].get("detected_language_confidence"):
+                                        st.caption(f"Confidence: {result['meta']['detected_language_confidence']:.2f}")
                                     st.subheader("📄 Full Transcription")
                                     st.text_area(
                                         "Complete Text",
                                         result["transcript"],
                                         height=200,
-                                        key=f"complete_text_{safe}"
+                                        key=f"complete_text_{safe}",
                                     )
                                     st.subheader("👥 Speaker Diarization")
                                     if result["utterances"]:
