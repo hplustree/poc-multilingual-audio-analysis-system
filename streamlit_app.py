@@ -18,6 +18,7 @@ import pandas as pd
 import threading
 import queue
 import whisper
+import librosa
 # === Config ===
 ASSEMBLYAI_API_KEY = st.secrets["api_keys"]["assemblyai"]
 UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
@@ -346,16 +347,17 @@ def detect_language_whisper(file_path):
 
     try:
         whisper_model = load_whisper_small_model()
-        audio = whisper.load_audio(file_path)
-        audio = whisper.pad_or_trim(audio)
-
+        data, samplerate = sf.read(file_path)
+        if len(data.shape) > 1:
+            data = np.mean(data, axis=1)
+        if samplerate != 16000:
+            data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
+        audio = whisper.pad_or_trim(data)
         mel = whisper.log_mel_spectrogram(audio).to(whisper_model.device)
         _, probs = whisper_model.detect_language(mel)
         detected_lang = max(probs, key=probs.get)
-        confidence = probs[detected_lang]
-
+        confidence = float(probs[detected_lang])
         st.success(f"Detected Language: **{detected_lang.upper()}** ({confidence:.2f})")
-
         return detected_lang, confidence
 
     except Exception as e:
