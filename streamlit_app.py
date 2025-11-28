@@ -343,27 +343,36 @@ def load_whisper_small_model():
     return whisper.load_model("small")
 
 def detect_language_whisper(file_path):
-    st.info("🌍 Detecting language (Whisper Small)...")
+    st.info("Detecting language (Whisper Small)...")
 
     try:
         whisper_model = load_whisper_small_model()
+
         data, samplerate = sf.read(file_path)
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
+
+        # 🔥 Convert dtype before resample
+        data = data.astype(np.float32)
+
+        # Resample if needed
         if samplerate != 16000:
-            data = librosa.resample(data, orig_sr=samplerate, target_sr=16000)
+            data = librosa.resample(data, orig_sr=samplerate, target_sr=16000).astype(np.float32)
+
+        # Whisper expects float32 16000hz mono
         audio = whisper.pad_or_trim(data)
         mel = whisper.log_mel_spectrogram(audio).to(whisper_model.device)
+
         _, probs = whisper_model.detect_language(mel)
         detected_lang = max(probs, key=probs.get)
         confidence = float(probs[detected_lang])
+
         st.success(f"Detected Language: **{detected_lang.upper()}** ({confidence:.2f})")
         return detected_lang, confidence
 
     except Exception as e:
-        st.warning(f"Whisper Small detection failed: {e}. Defaulting to English.")
+        st.warning(f"⚠️ Whisper Small detection failed: {e}. Defaulting to English.")
         return "en", 0.5
-
 
 def normalize_speakers(utterances):
     """Rename speakers to Speaker A, B, ... and remove timestamps"""
