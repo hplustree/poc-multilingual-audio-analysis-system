@@ -28,6 +28,23 @@ client = Anthropic(api_key=CLAUDE_API_KEY)
 SONIOX_BASE_URL = "https://api.soniox.com/v1"
 
 SONIOX_API_KEY= st.secrets["api_keys"]["soniox"]
+
+# Language code to name mapping
+LANGUAGE_NAMES = {
+    "en": "ENGLISH",
+    "hi": "HINDI",
+    "ml": "MALAYALAM",
+}
+
+def format_language_display(lang_code, confidence=None):
+    """Format language as 'CODE-NAME' with optional confidence score."""
+    lang_code_upper = lang_code.upper()
+    lang_name = LANGUAGE_NAMES.get(lang_code.lower(), lang_code.upper())
+    display = f"{lang_code_upper}-{lang_name}"
+    if confidence is not None:
+        display += f" (confidence: {confidence:.2f})"
+    return display
+
 # === Helper functions ===
 if "zip_state" not in st.session_state:
     st.session_state["zip_state"] = {
@@ -54,14 +71,14 @@ def claude_worker():
         if item is None:
             break  # stop thread
 
-        text, callback = item
+        text, detected_language, callback = item
 
         # Enforce safe spacing between API calls
         elapsed = time.time() - last_call_time
         if elapsed < CLAUDE_MIN_DELAY:
             time.sleep(CLAUDE_MIN_DELAY - elapsed)
 
-        result = analyze_with_claude(text)  # <-- your existing function
+        result = analyze_with_claude(text, detected_language)
         last_call_time = time.time()
 
         # Return result to waiting thread
@@ -155,11 +172,12 @@ def detect_language(audio_url):
             if res["status"] == "completed":
                 detected_lang = res.get("language_code", "en")
                 confidence = res.get("language_confidence", 0)
-                st.success(f"✅ Detected: **{detected_lang.upper()}** (confidence: {confidence:.2f})")
-                return detected_lang
+                lang_display = format_language_display(detected_lang, confidence)
+                st.success(f"✅ Detected: **{lang_display}**")
+                return detected_lang, confidence
             elif res["status"] == "error":
                 st.warning("⚠️ Language detection failed, defaulting to English")
-                return "en"
+                return "en", 0.0
             time.sleep(2)
 
 @retry_api(extra_delay=1)
@@ -475,7 +493,9 @@ def extract_json_from_text(response_text: str) -> dict:
     partial = {}
 
     fields = [
-        "Category",
+        "Main Category",
+        "Sub Category",
+        "Language",
         "Sentiment Score",
         "Sentiment Label",
         "Conversation Flow",
@@ -496,17 +516,20 @@ def extract_json_from_text(response_text: str) -> dict:
 
 
 @retry_api(extra_delay=2)
-def analyze_with_claude(text):
+def analyze_with_claude(text, detected_language="en"):
     sanitized_text = robust_sanitize_multilingual_text(text)
+    lang_display = format_language_display(detected_language)
     prompt = f"""Analyze this conversation and return your analysis as a JSON object.
 
 <conversation>
 {sanitized_text}
 </conversation>
 
+The conversation language is: {lang_display}
+
 Analyze the conversation for:
 1. Overall sentiment (Positive/Negative/Neutral) and score (0.0 to 1.0)
-2. Main topic/category
+2. Main category and sub-category (e.g., Main: "Customer Service", Sub: "Billing Inquiry")
 3. How the conversation flows between speakers
 4. Emotional progression for each speaker with transitions
 5. Speaker characteristics (mood, likely gender)
@@ -523,7 +546,9 @@ IMPORTANT FORMATTING RULES:
 
 Return this exact JSON structure:
 {{
-  "Category": "main topic here",
+  "Main Category": "broad category here",
+  "Sub Category": "specific sub-category here",
+  "Language": "{lang_display}",
   "Sentiment Score": 0.75,
   "Sentiment Label": "Positive",
   "Conversation Flow": "single line description of how conversation developed",
@@ -572,7 +597,9 @@ Output the JSON now:"""
         result = extract_json_from_text(response_text)
 
         required_keys = [
-            "Category",
+            "Main Category",
+            "Sub Category",
+            "Language",
             "Sentiment Score",
             "Sentiment Label",
             "Conversation Flow",
@@ -591,11 +618,14 @@ Output the JSON now:"""
 
         if result["Sentiment Label"] not in ["Positive", "Negative", "Neutral"]:
             result["Sentiment Label"] = "Neutral"
+        result["Language"] = format_language_display(detected_language)
         return result
     except json.JSONDecodeError as e:
         st.error(f"JSON parsing error: {e}")
         return {
-            "Category": "Parse Error",
+            "Main Category": "Parse Error",
+            "Sub Category": "N/A",
+            "Language": "Unknown",
             "Sentiment Score": 0.5,
             "Sentiment Label": "Neutral",
             "Conversation Flow": "N/A",
@@ -605,7 +635,9 @@ Output the JSON now:"""
     except Exception as e:
         st.error(f"Claude API error: {e}")
         return {
-            "Category": "API Error",
+            "Main Category": "API Error",
+            "Sub Category": "N/A",
+            "Language": "Unknown",
             "Sentiment Score": 0.5,
             "Sentiment Label": "Neutral",
             "Conversation Flow": "N/A",
@@ -635,8 +667,7 @@ def process_audio_file(file_path, provider):
                 detected_language, lang_conf = detect_language_whisper(denoised_path)
                 result = transcribe_soniox(denoised_path, detected_language)
         else:
-            detected_language = detect_language(audio_url)
-            lang_conf = None
+            detected_language, lang_conf = detect_language(audio_url)
             with st.spinner(f"📝 Transcribing with AssemblyAI in {detected_language.upper()}..."):
                 result = transcribe(audio_url, language_code=detected_language)
 
@@ -650,11 +681,12 @@ def process_audio_file(file_path, provider):
             event.set()
 
         if full_text:
-            # enqueue safely
-            claude_queue.put((full_text, on_done))
+            claude_queue.put((full_text, detected_language, on_done))
             event.wait()  # wait for Claude result
 
         analysis = analysis_container["value"] if full_text else {}
+        if analysis and lang_conf is not None:
+            analysis["Language Confidence"] = lang_conf
 
         # Include full diarization but without timestamps
         utterances = result.get("utterances", [])
@@ -699,13 +731,10 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
     if result["status"] == "success":
         analysis = result["analysis"]
         st.success("✅ File processed successfully!")
-        st.write(
-            f"**Detected Language:** {result['meta']['detected_language'].upper()} "
-        )
-        if result['meta'].get('detected_language_confidence'):
-            st.caption(
-                f"Confidence: {result['meta']['detected_language_confidence']:.2f}"
-            )
+        lang_code = result['meta']['detected_language']
+        lang_conf = result['meta'].get('detected_language_confidence')
+        lang_display = format_language_display(lang_code, lang_conf)
+        st.write(f"**Detected Language:** {lang_display}")
 
         st.subheader("📄 Full Transcription")
         single_key = f"single_{uploaded_file.name}_{uploaded_file.size}"
@@ -725,7 +754,9 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
             st.info("No speaker diarization available.")
 
         st.subheader("🤖 AI Analysis: Sentiment & Summary")
-        st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
+        st.write(f"**Language:** {analysis.get('Language', 'N/A')}")
+        st.write(f"**Main Category:** {analysis.get('Main Category', 'N/A')}")
+        st.write(f"**Sub Category:** {analysis.get('Sub Category', 'N/A')}")
         st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
         st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
         st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
@@ -742,7 +773,7 @@ if uploaded_file and uploaded_file.name.lower().endswith((".wav", ".mp3", ".m4a"
         else:
             st.info("No detailed emotion flow available.")
 
-        st.subheader("🗣️ Speaker Analysis (No Age)")
+        st.subheader("🗣️ Speaker Analysis")
         speaker_analysis = analysis.get("Speaker Analysis", [])
         if speaker_analysis:
             for sa in speaker_analysis:
@@ -829,9 +860,11 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                                 with st.expander(f"✅ {rel}", expanded=False):
                                     st.write(f"**Provider:** {result['meta']['provider']}")
                                     st.write(f"**Segments:** {result['meta']['total_segments']}")
-                                    st.write(f"**Detected Language:** {result['meta']['detected_language'].upper()}")
-                                    if result['meta'].get("detected_language_confidence"):
-                                        st.caption(f"Confidence: {result['meta']['detected_language_confidence']:.2f}")
+                                    # Display detected language with formatted name
+                                    lang_code = result['meta']['detected_language']
+                                    lang_conf = result['meta'].get('detected_language_confidence')
+                                    lang_display = format_language_display(lang_code, lang_conf)
+                                    st.write(f"**Detected Language:** {lang_display}")
                                     st.subheader("📄 Full Transcription")
                                     st.text_area(
                                         "Complete Text",
@@ -848,7 +881,9 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
                                         st.info("No speaker diarization available.")
 
                                     st.subheader("🤖 AI Analysis: Sentiment & Summary")
-                                    st.write(f"**Category:** {analysis.get('Category', 'N/A')}")
+                                    st.write(f"**Language:** {analysis.get('Language', 'N/A')}")
+                                    st.write(f"**Main Category:** {analysis.get('Main Category', 'N/A')}")
+                                    st.write(f"**Sub Category:** {analysis.get('Sub Category', 'N/A')}")
                                     st.write(f"**Sentiment Score:** {analysis.get('Sentiment Score', 'N/A')}")
                                     st.write(f"**Sentiment Label:** {analysis.get('Sentiment Label', 'N/A')}")
                                     st.write(f"**Conversation Flow:** {analysis.get('Conversation Flow', 'N/A')}")
@@ -912,9 +947,11 @@ elif uploaded_file and uploaded_file.name.lower().endswith(".zip"):
             df = pd.DataFrame([
                 {
                     "File": r["filename"],
+                    "Language": r["analysis"].get("Language", ""),
+                    "Main Category": r["analysis"].get("Main Category", ""),
+                    "Sub Category": r["analysis"].get("Sub Category", ""),
                     "Sentiment": r["analysis"].get("Sentiment Label", ""),
                     "Score": r["analysis"].get("Sentiment Score", ""),
-                    "Category": r["analysis"].get("Category", ""),
                     "Summary": r["analysis"].get("Summary", "")
                 }
                 for r in success
